@@ -643,9 +643,9 @@ class SongPlayer(QtWidgets.QMainWindow):
         playlistButtonLayout.addWidget(self.playlistDropdown)
 
         self.playlistTable = QtWidgets.QTableWidget()
-        self.playlistTable.setColumnCount(8)
+        self.playlistTable.setColumnCount(9)
         self.playlistTable.setHorizontalHeaderLabels(
-            ["Pfad", "Titel", "Interpret", "Album", "Dauer", "Genre", "YT", "Spotify"])
+            ["Pfad", "Titel", "Interpret", "Album", "Dauer", "Genre", "YT", "SP", "AM"])
         self.playlistTable.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.playlistTable.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.playlistTable.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1246,6 +1246,12 @@ class SongPlayer(QtWidgets.QMainWindow):
             sp_btn.setCursor(Qt.PointingHandCursor)
             sp_btn.clicked.connect(partial(self._open_spotify, song))
             self.playlistTable.setCellWidget(row, 7, sp_btn)
+            # Amazon Music Button
+            am_btn = QtWidgets.QPushButton("AM")
+            am_btn.setFixedWidth(36)
+            am_btn.setCursor(Qt.PointingHandCursor)
+            am_btn.clicked.connect(partial(self._open_amazon_music, song))
+            self.playlistTable.setCellWidget(row, 8, am_btn)
 
             # Aktuell spielenden Song hervorheben
             if row == self.current_index:
@@ -1315,7 +1321,7 @@ class SongPlayer(QtWidgets.QMainWindow):
                     dur = song.get('duration_sec', -1)
                     f.write(f"#EXTINF:{dur},{artist} - {title}\n{song['file_path']}\n")
 
-            # Titelliste für Streaming-Dienste
+            # Titelliste für Streaming-Dienste (TuneMyMusic, Soundiiz, etc.)
             txt_path = os.path.join(export_dir, f"{name}_titles.txt")
             with open(txt_path, 'w', encoding='utf-8') as f:
                 for song in self.current_playlist:
@@ -1323,9 +1329,28 @@ class SongPlayer(QtWidgets.QMainWindow):
                     if line.strip() != '-':
                         f.write(line + "\n")
 
+            # CSV für Playlist-Import-Services (TuneMyMusic, Soundiiz, FreeYourMusic)
+            csv_path = os.path.join(export_dir, f"{name}_import.csv")
+            with open(csv_path, 'w', encoding='utf-8') as f:
+                f.write("Title,Artist,Album,Duration\n")
+                for song in self.current_playlist:
+                    title = song.get('title', '').replace('"', '""')
+                    artist = song.get('artist', '').replace('"', '""')
+                    album = song.get('album', '').replace('"', '""')
+                    duration = song.get('duration', '')
+                    f.write(f'"{title}","{artist}","{album}","{duration}"\n')
+
             QMessageBox.information(self, "Export",
                 f"Playlist exportiert nach:\n{export_dir}\n\n"
-                f"'{name}_titles.txt' kann für Amazon, YouTube Music oder Spotify verwendet werden.")
+                f"Dateien:\n"
+                f"  {name}.m3u — Standard-Playlist\n"
+                f"  {name}_titles.txt — Titelliste (Artist - Title)\n"
+                f"  {name}_import.csv — CSV für TuneMyMusic/Soundiiz\n\n"
+                f"Für Amazon Music / Spotify / YouTube Music:\n"
+                f"1. Öffne tunemymusic.com oder soundiiz.com\n"
+                f"2. Wähle 'Import from File'\n"
+                f"3. Lade die CSV oder TXT-Datei hoch\n"
+                f"4. Wähle Amazon Music als Ziel")
             self.update_playlist_dropdown()
         except Exception as e:
             QMessageBox.critical(self, "Fehler", f"Export-Fehler: {e}")
@@ -1483,6 +1508,7 @@ class SongPlayer(QtWidgets.QMainWindow):
         action_mb = menu.addAction("🌐 Tags online suchen (MusicBrainz)")
         action_yt = menu.addAction("🔍 YouTube suchen")
         action_sp = menu.addAction("🔍 Spotify suchen")
+        action_am = menu.addAction("🔍 Amazon Music suchen")
 
         action = menu.exec_(self.songTable.viewport().mapToGlobal(pos))
         if action == action_play:
@@ -1509,6 +1535,8 @@ class SongPlayer(QtWidgets.QMainWindow):
             self._open_youtube(song)
         elif action == action_sp:
             self._open_spotify(song)
+        elif action == action_am:
+            self._open_amazon_music(song)
 
     def show_playlist_context_menu(self, pos):
         index = self.playlistTable.indexAt(pos)
@@ -1532,6 +1560,7 @@ class SongPlayer(QtWidgets.QMainWindow):
         menu.addSeparator()
         action_yt = menu.addAction("🔍 YouTube suchen")
         action_sp = menu.addAction("🔍 Spotify suchen")
+        action_am = menu.addAction("🔍 Amazon Music suchen")
 
         action = menu.exec_(self.playlistTable.viewport().mapToGlobal(pos))
         if action == action_play:
@@ -1552,6 +1581,8 @@ class SongPlayer(QtWidgets.QMainWindow):
             self._open_youtube(song)
         elif action == action_sp:
             self._open_spotify(song)
+        elif action == action_am:
+            self._open_amazon_music(song)
 
     def _open_in_explorer(self, path):
         if os.path.exists(path):
@@ -1788,6 +1819,13 @@ class SongPlayer(QtWidgets.QMainWindow):
         if not query:
             query = os.path.splitext(os.path.basename(song['file_path']))[0]
         url = f"https://open.spotify.com/search/{urllib.parse.quote(query)}"
+        threading.Thread(target=webbrowser.open_new_tab, args=(url,), daemon=True).start()
+
+    def _open_amazon_music(self, song):
+        query = f"{song.get('artist', '')} {song.get('title', '')}".strip()
+        if not query:
+            query = os.path.splitext(os.path.basename(song['file_path']))[0]
+        url = f"https://music.amazon.de/search/{urllib.parse.quote(query)}"
         threading.Thread(target=webbrowser.open_new_tab, args=(url,), daemon=True).start()
 
     # ==================== Fenster schließen ====================
