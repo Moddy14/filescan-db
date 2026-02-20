@@ -139,48 +139,80 @@ def stop_monitoring():
         logger.info("Kein aktiver Observer zum Stoppen gefunden.")
 
 # --- Hauptlogik ---
+def start_scheduled_scanner():
+    """Startet den Scheduled Scanner als Hintergrund-Thread."""
+    try:
+        from scheduled_scanner import run_scheduler_loop
+        scheduler_thread = threading.Thread(
+            target=run_scheduler_loop,
+            kwargs={'interval': 30, 'stop_event': stop_event},
+            daemon=True,
+            name="ScheduledScanner"
+        )
+        scheduler_thread.start()
+        logger.info("[Watchdog Service] Scheduled Scanner als Hintergrund-Thread gestartet.")
+        return scheduler_thread
+    except ImportError:
+        logger.warning("[Watchdog Service] scheduled_scanner nicht verfuegbar. Geplante Scans deaktiviert.")
+        return None
+    except Exception as e:
+        logger.error(f"[Watchdog Service] Fehler beim Starten des Scheduled Scanners: {e}")
+        return None
+
+
 def main_service_loop():
     """Hauptschleife des Dienstes mit erweiteter Fehlerbehandlung."""
     retry_count = 0
     max_retries = 3
-    
+    scheduler_thread = None
+
     while retry_count < max_retries:
         try:
             logger.info(f"Watchdog Service wird gestartet... (Versuch {retry_count + 1}/{max_retries})")
-            
+
             if not start_monitoring():
-                logger.error(f"Fehler beim Starten der Überwachung (Versuch {retry_count + 1}).")
+                logger.error(f"Fehler beim Starten der Ueberwachung (Versuch {retry_count + 1}).")
                 retry_count += 1
                 if retry_count < max_retries:
-                    logger.info(f"Warte 30 Sekunden vor nächstem Versuch...")
+                    logger.info(f"Warte 30 Sekunden vor naechstem Versuch...")
                     time.sleep(30)
                     continue
                 else:
                     logger.error("Maximale Wiederholungen erreicht. Dienst wird beendet.")
                     return
-            
-            logger.info("Service läuft. Warte auf Stop-Signal...")
-            
-            # Heartbeat-Überwachung
+
+            # Starte Scheduled Scanner als Hintergrund-Thread
+            if scheduler_thread is None or not scheduler_thread.is_alive():
+                scheduler_thread = start_scheduled_scanner()
+
+            logger.info("Service laeuft. Warte auf Stop-Signal...")
+
+            # Heartbeat-Ueberwachung
             heartbeat_counter = 0
-            
+
             while not stop_event.is_set():
-                # Prüfe alle 60 Sekunden, ob Observer noch aktiv ist
+                # Pruefe alle 60 Sekunden, ob Observer noch aktiv ist
                 if heartbeat_counter % 60 == 0:
                     if observer and not observer.is_alive():
-                        logger.warning("Observer-Thread ist abgestürzt. Starte Neustart...")
+                        logger.warning("Observer-Thread ist abgestuerzt. Starte Neustart...")
                         stop_monitoring()
-                        raise Exception("Observer-Thread abgestürzt")
-                    
+                        raise Exception("Observer-Thread abgestuerzt")
+
                     # Log Heartbeat alle 10 Minuten
                     if heartbeat_counter % 600 == 0:
-                        logger.info("Watchdog Service Heartbeat - Service läuft normal")
-                
+                        scheduler_status = "aktiv" if (scheduler_thread and scheduler_thread.is_alive()) else "inaktiv"
+                        logger.info(f"Watchdog Service Heartbeat - Service laeuft normal (Scheduler: {scheduler_status})")
+
+                        # Scheduler neu starten wenn er abgestuerzt ist
+                        if scheduler_thread and not scheduler_thread.is_alive():
+                            logger.warning("[Watchdog Service] Scheduled Scanner abgestuerzt, starte neu...")
+                            scheduler_thread = start_scheduled_scanner()
+
                 time.sleep(1)
                 heartbeat_counter += 1
-            
+
             break  # Normale Beendigung
-            
+
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt empfangen. Beende Dienst...")
             stop_event.set()
@@ -194,8 +226,9 @@ def main_service_loop():
                 time.sleep(30)
             else:
                 logger.error("Maximale Wiederholungen erreicht. Service wird beendet.")
-    
-    # Aufräumen
+
+    # Aufraeumen
+    stop_event.set()  # Signal an Scheduler-Thread
     stop_monitoring()
     logger.info("Watchdog Service beendet.")
 

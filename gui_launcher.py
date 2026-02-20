@@ -551,6 +551,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(300, 200, 850, 650) # Etwas größer
         self.scan_worker = None
         self.scan_process = None
+        self.integrity_process = None
         self.log_display = None
         self.progress_bar = None # Hinzugefügt in setupUI? -> Nein, aktuell nicht
         self.status_label = None # Hinzugefügt in setupUI? -> Nein, aktuell nicht
@@ -903,7 +904,7 @@ class MainWindow(QMainWindow):
 
         self.check_button = QtWidgets.QPushButton("🧪 Integritätsprüfung")
         self.check_button.clicked.connect(self.start_integrity)
-        self.check_button.setEnabled(False)
+        self.check_button.setEnabled(True)  # Immer aktiv — globaler Check möglich
         button_layout.addWidget(self.check_button)
 
         button_layout.addStretch() # Fügt Platz hinzu, damit Buttons links bleiben
@@ -972,13 +973,11 @@ class MainWindow(QMainWindow):
             self.update_selected_path_display()
             self.select_folder_button.setEnabled(True)
             self.scan_button.setEnabled(True)
-            self.check_button.setEnabled(True)
         else:
             self.current_scan_path = None
             self.update_selected_path_display()
             self.select_folder_button.setEnabled(False)
             self.scan_button.setEnabled(False)
-            self.check_button.setEnabled(False)
 
     def select_folder(self):
         """Öffnet den Ordnerauswahl-Dialog, startend im aktuell gewählten Laufwerk."""
@@ -1004,7 +1003,7 @@ class MainWindow(QMainWindow):
             # Buttons aktivieren/deaktivieren basierend darauf, ob ein Pfad gesetzt ist
             is_path_valid = bool(self.current_scan_path and os.path.isdir(self.current_scan_path))
             self.scan_button.setEnabled(is_path_valid)
-            self.check_button.setEnabled(is_path_valid) # Integritätsprüfung kann jetzt auch pfadbasiert sein
+            # check_button bleibt immer aktiv — globaler Check ohne Pfad möglich
             # Ordner-Auswahl nur aktivieren, wenn ein *Laufwerk* gewählt ist (oder ein Pfad)
             self.select_folder_button.setEnabled(is_path_valid)
 
@@ -1300,8 +1299,188 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Fehler", f"Fehler beim Bereinigen: {e}")
     
     def start_integrity(self):
-        path = self.current_scan_path
-        self.start_process("integrity_checker.py", path)
+        """Startet die Integritaetspruefung via QProcess mit Fortschrittsanzeige."""
+        # Prüfe ob bereits eine Integritätsprüfung läuft
+        if hasattr(self, 'integrity_process') and self.integrity_process and self.integrity_process.state() == QProcess.Running:
+            QMessageBox.warning(self, "Bereits aktiv", "Eine Integritätsprüfung läuft bereits.")
+            return
+
+        # Prüfe ob ein Scan läuft (Scan-Lock)
+        db = get_db_instance()
+        if db.is_scan_running():
+            scan_details = self.get_detailed_scan_status()
+            message = "Es läuft bereits ein Scan-Prozess:\n\n"
+            message += scan_details
+            message += "\n\nMöchten Sie die Integritätsprüfung trotzdem starten?"
+            reply = QMessageBox.question(self, "Scan läuft", message,
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+
+        # Dialog: Gesamte DB oder nur gewählten Pfad prüfen?
+        integrity_path = None
+        if self.current_scan_path and os.path.isdir(self.current_scan_path):
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Integritätsprüfung")
+            dialog.setIcon(QMessageBox.Question)
+            dialog.setText("Was soll geprüft werden?")
+            gesamt_btn = dialog.addButton("Gesamte Datenbank", QMessageBox.AcceptRole)
+            pfad_btn = dialog.addButton(f"Nur: {self.current_scan_path}", QMessageBox.AcceptRole)
+            abbrechen_btn = dialog.addButton("Abbrechen", QMessageBox.RejectRole)
+            dialog.exec_()
+            clicked = dialog.clickedButton()
+            if clicked == abbrechen_btn:
+                return
+            elif clicked == pfad_btn:
+                integrity_path = self.current_scan_path
+            # Bei gesamt_btn: integrity_path bleibt None -> gesamte DB
+        # Kein gültiger Pfad gewählt -> automatisch gesamte DB
+
+        # Watchdog pausieren
+        self.watchdog_was_paused_integrity = False
+        try:
+            from watchdog_control import find_watchdog_pid, stop_watchdog
+            watchdog_pid = find_watchdog_pid()
+            if watchdog_pid:
+                reply = QMessageBox.question(self, "Watchdog-Service läuft",
+                                             f"Der Watchdog-Service läuft (PID: {watchdog_pid}).\n\n"
+                                             "Soll der Watchdog automatisch pausiert werden?\n"
+                                             "(Empfohlen um 'database is locked' Fehler zu vermeiden)",
+                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if reply == QMessageBox.Yes:
+                    self.log_display.append("[INFO] Pausiere Watchdog-Service für Integritätsprüfung...")
+                    if stop_watchdog():
+                        self.log_display.append("[OK] Watchdog-Service pausiert")
+                        self.watchdog_was_paused_integrity = True
+                    else:
+                        self.log_display.append("[WARNUNG] Konnte Watchdog nicht pausieren")
+        except ImportError:
+            logger.warning("[GUI] watchdog_control nicht verfügbar")
+        except Exception as e:
+            logger.error(f"[GUI] Fehler bei Watchdog-Kontrolle: {e}")
+
+        # UI vorbereiten
+        self.check_button.setEnabled(False)
+        self.log_display.append("\n" + "=" * 50)
+        if integrity_path:
+            self.log_display.append(f"Starte Integritätsprüfung für: {integrity_path}")
+        else:
+            self.log_display.append("Starte globale Integritätsprüfung (gesamte Datenbank)")
+        self.log_display.append("=" * 50)
+
+        # QProcess starten
+        python_exe = os.path.join(os.path.dirname(sys.executable), 'python.exe')
+        script_path = os.path.join(os.path.dirname(__file__), 'integrity_checker.py')
+        args = [script_path]
+        if integrity_path:
+            args.append(integrity_path)
+
+        self.integrity_process = QProcess(self)
+
+        # Encoding sicherstellen
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        self.integrity_process.setProcessEnvironment(env)
+
+        self.integrity_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.integrity_process.readyReadStandardOutput.connect(self.handle_integrity_output)
+        self.integrity_process.finished.connect(self.integrity_finished)
+
+        logger.info(f"[GUI] Starte Integritätsprüfung: {python_exe} {' '.join(args)}")
+        self.integrity_process.start(python_exe, args)
+
+    def handle_integrity_output(self):
+        """Parst die stdout-Ausgabe des Integritäts-Prozesses."""
+        if not self.integrity_process:
+            return
+        raw = self.integrity_process.readAllStandardOutput()
+        text = bytes(raw).decode('utf-8', errors='replace')
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("@@PHASE:"):
+                phase = line[8:]
+                if phase == "dirs":
+                    self.log_display.append("[Integritätsprüfung] Phase: Verzeichnisse prüfen...")
+                elif phase == "files":
+                    self.log_display.append("[Integritätsprüfung] Phase: Dateien prüfen...")
+
+            elif line.startswith("@@PROGRESS:"):
+                parts = line[11:].split(":")
+                if len(parts) == 2:
+                    try:
+                        current = int(parts[0])
+                        total = int(parts[1])
+                        if total > 0:
+                            pct = int(current / total * 100)
+                            # Aktualisiere letzte Zeile im Log mit Fortschritt
+                            self.log_display.append(f"  Fortschritt: {current:,}/{total:,} ({pct}%)")
+                    except ValueError:
+                        pass
+
+            elif line.startswith("@@RESULT:"):
+                json_str = line[9:]
+                try:
+                    self._integrity_result = json.loads(json_str)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"[GUI] Konnte Integritäts-Ergebnis nicht parsen: {json_str}")
+
+            else:
+                # Normale Log-Ausgabe
+                self.log_display.append(line)
+
+        # Auto-Scroll
+        self.log_display.moveCursor(QtGui.QTextCursor.End)
+
+    def integrity_finished(self, exitCode, exitStatus):
+        """Wird aufgerufen, wenn der Integritäts-Prozess beendet ist."""
+        self.check_button.setEnabled(True)
+
+        if exitStatus == QProcess.NormalExit and exitCode == 0:
+            # Zeige Zusammenfassung
+            result = getattr(self, '_integrity_result', None)
+            if result:
+                summary = (
+                    f"Integritätsprüfung abgeschlossen ({result.get('duration', '?')} Sek.)\n\n"
+                    f"Geprüft:\n"
+                    f"  Verzeichnisse: {result.get('checked_dirs', 0):,}\n"
+                    f"  Dateien: {result.get('checked_files', 0):,}\n\n"
+                    f"Ergebnis:\n"
+                    f"  Fehlende Verzeichnisse: {result.get('missing_dirs', 0):,}\n"
+                    f"  Fehlende Dateien: {result.get('missing_files', 0):,}\n"
+                    f"  Aktualisierte Dateien: {result.get('updated_files', 0):,}"
+                )
+                self.log_display.append(f"\n--- {summary.replace(chr(10), chr(10) + '    ')} ---")
+                QMessageBox.information(self, "Integritätsprüfung abgeschlossen", summary)
+            else:
+                self.log_display.append("\n--- Integritätsprüfung abgeschlossen ---")
+                QMessageBox.information(self, "Abgeschlossen", "Integritätsprüfung erfolgreich abgeschlossen.")
+        elif exitStatus == QProcess.CrashExit:
+            self.log_display.append(f"\n--- FEHLER: Integritätsprüfung abgestürzt (Code: {exitCode}) ---")
+            QMessageBox.critical(self, "Fehler", f"Integritätsprüfung abgestürzt (Exit code: {exitCode})")
+        else:
+            self.log_display.append(f"\n--- Integritätsprüfung mit Fehlern beendet (Code: {exitCode}) ---")
+            QMessageBox.warning(self, "Fehler", f"Integritätsprüfung mit Fehlern beendet (Exit code: {exitCode})")
+
+        # Watchdog neu starten wenn pausiert
+        if hasattr(self, 'watchdog_was_paused_integrity') and self.watchdog_was_paused_integrity:
+            try:
+                from watchdog_control import start_watchdog
+                self.log_display.append("[INFO] Starte Watchdog-Service neu...")
+                if start_watchdog():
+                    self.log_display.append("[OK] Watchdog-Service wieder gestartet")
+                else:
+                    self.log_display.append("[WARNUNG] Konnte Watchdog nicht neu starten")
+                self.watchdog_was_paused_integrity = False
+            except Exception as e:
+                logger.error(f"[GUI] Fehler beim Neustarten des Watchdog: {e}")
+
+        self.integrity_process = None
+        self._integrity_result = None
+        logger.info(f"[GUI] Integritätsprüfung beendet. ExitCode: {exitCode}")
 
     # --- Methode zum Öffnen des Hashing-Dialogs --- 
     def open_hashing_settings(self):
@@ -1349,6 +1528,19 @@ class MainWindow(QMainWindow):
             self.log_updater.wait(1500) # Warte kurz auf Beendigung
             logger.info("[GUI] LogUpdater gestoppt.")
             
+        # Prüfe, ob ein Integritäts-Prozess läuft
+        if hasattr(self, 'integrity_process') and self.integrity_process and self.integrity_process.state() == QProcess.Running:
+            reply = QMessageBox.question(self, "Integritätsprüfung läuft",
+                                 "Eine Integritätsprüfung läuft aktuell. Was möchten Sie tun?",
+                                 QMessageBox.Cancel | QMessageBox.Ignore,
+                                 QMessageBox.Ignore)
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            else:
+                self.integrity_process.setProcessState(QProcess.NotRunning)
+                logger.info("[GUI] GUI wird geschlossen, Integritätsprüfung läuft im Hintergrund weiter.")
+
         # Prüfe, ob ein Scan-Prozess läuft
         if self.scan_process and self.scan_process.state() == QProcess.Running:
             reply = QMessageBox.question(self, "Scan läuft",
