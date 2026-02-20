@@ -1,0 +1,1 @@
+Erstelle eine pyqt5-gui mit wow-effekt. Es soll ein Dateinamen eingegeben werden können und damit dann in allen Laufwerken der Datenbank danach gesucht werden. Wenn gefunden soll es möglich sein diese Datei zu öffnen, aus DB und physisch zu löschen, zu betrachten (Vorschau), zu verschieben und zu renamen (sowohl physisch als auch Anpassung der Datenbank)

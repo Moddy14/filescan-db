@@ -1,0 +1,55 @@
+# Python standard ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Project specific ignores
+Dateien.db*
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.db.bak
+*.db.old*
+*.log
+nul
+config.json
+scheduled_scan_status.json
+
+# Test files and directories
+test_*
+*_test.py
+*test.txt
+debug_*.py
+full_system_test*
+quick_test.bat
+run_test_inline.bat
+test_scan_dir/
+ScanStatusMonitor/
+
+# Backup files
+*.zip
+*.backup*
+
+# Playlists (change frequently)
+Dateien_Skripte/playlists/*.m3u
+
+# Build artifacts
+build/
+dist/
+*.spec 

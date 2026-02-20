@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.run_scanner_gui.bat)",
+      "Bash(cmd /c:*)",
+      "Bash(start run_scanner_gui.bat)",
+      "Bash(python:*)",
+      "Bash(run_scanner_gui.bat)",
+      "Bash(tasklist:*)",
+      "Bash(wmic:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell:*)",
+      "Bash(start python systray_launcher.py)",
+      "Bash(dir:*)",
+      "Bash(sqlite3:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "Bash(quick_test.bat)",
+      "Bash(start full_system_test.bat)",
+      "Bash(taskkill:*)",
+      "Bash(del Dateien.db)",
+      "Bash(del full_system_test.bat)",
+      "Bash(ren:*)",
+      "Bash(full_system_test.bat)",
+      "Bash(./run_test_inline.bat)",
+      "Bash(setx:*)",
+      "Bash(start pythonw systray_launcher_full.py)",
+      "Bash(start /min \"Watchdog-Service\":*)",
+      "Bash(start /min python:*)",
+      "Bash(rg:*)",
+      "Bash(git add:*)",
+      "Bash(git reset:*)",
+      "Bash(reg add:*)",
+      "Bash(sc query:*)",
+      "Bash(sc continue:*)",
+      "Bash(git fsck:*)",
+      "Bash(./comprehensive_system_test.bat)",
+      "Bash(cmd.exe /c \"sc qc DateiScannerWatchdog\")",
+      "Bash(cmd.exe /c \"reg query \"\"HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\DateiScannerWatchdog\\\\Parameters\"\"\")"
+    ],
+    "deny": []
+  }
+}
