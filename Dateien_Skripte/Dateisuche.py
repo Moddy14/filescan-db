@@ -249,6 +249,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Datei Suche - Erweiterte Filter & Icons")
         self.resize(1150, 770) # Höhe leicht erhöht für Statusleiste
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'search_simple.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         self.db_path = db_path
         self.conn = None
         self.connect_db()

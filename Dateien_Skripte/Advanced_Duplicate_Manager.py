@@ -113,35 +113,35 @@ class DuplicateScanThread(QThread):
                             include_paths, exclude_paths, backup_patterns,
                             min_size, max_size):
         """Findet doppelte Dateien"""
-        
+
         self.progress.emit("Suche doppelte Dateien...")
-        
-        where_sql, params = self.build_where_clause(include_drives, exclude_drives,
-                                                   include_paths, exclude_paths)
-        
-        # Größen-Filter hinzufügen
-        if where_sql:
-            where_sql += " AND "
-        else:
-            where_sql = "WHERE "
-        
-        size_conditions = []
+
+        where_clauses, params = self.build_where_clause(include_drives, exclude_drives,
+                                                        include_paths, exclude_paths)
+
+        # Groessen-Filter hinzufuegen
+        extra_clauses = []
+        extra_params = []
         if min_size > 0:
-            size_conditions.append("f.size >= ?")
-            params.append(min_size)
+            extra_clauses.append("f.size >= ?")
+            extra_params.append(min_size)
         if max_size is not None:
-            size_conditions.append("f.size <= ?")
-            params.append(max_size)
-        
-        if size_conditions:
-            where_sql += " AND ".join(size_conditions)
-        else:
-            where_sql = where_sql.rstrip(" AND ").rstrip("WHERE ")
-        
-        # Hauptabfrage mit CTEs
+            extra_clauses.append("f.size <= ?")
+            extra_params.append(max_size)
+
+        # WHERE zusammenbauen (sauber ohne rstrip)
+        all_clauses = []
+        if where_clauses:
+            all_clauses.append(where_clauses.replace("WHERE ", "", 1))
+        all_clauses.extend(extra_clauses)
+
+        where_sql = ("WHERE " + " AND ".join(all_clauses)) if all_clauses else ""
+        all_params = params + extra_params
+
+        # Hauptabfrage mit CTEs — WHERE in CTE UND aeusserem Query
         query = f"""
         WITH duplicate_groups AS (
-            SELECT 
+            SELECT
                 f.filename,
                 f.extension_id,
                 f.size,
@@ -155,11 +155,11 @@ class DuplicateScanThread(QThread):
             ORDER BY total_size DESC
             LIMIT 1000
         )
-        SELECT 
+        SELECT
             f.id,
             d.full_path,
             f.filename,
-            e.name as extension,
+            CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END as extension,
             f.size,
             f.hash,
             f.modified_date,
@@ -167,23 +167,27 @@ class DuplicateScanThread(QThread):
             dg.total_size,
             dr.name as drive_name
         FROM duplicate_groups dg
-        JOIN files f ON f.filename = dg.filename 
-            AND f.extension_id IS NOT DISTINCT FROM dg.extension_id
+        JOIN files f ON f.filename = dg.filename
+            AND f.extension_id IS dg.extension_id
             AND f.size = dg.size
         JOIN directories d ON f.directory_id = d.id
         JOIN drives dr ON d.drive_id = dr.id
         LEFT JOIN extensions e ON f.extension_id = e.id
+        {where_sql}
         ORDER BY dg.total_size DESC, f.filename, d.full_path
         """
-        
-        cursor.execute(query, params)
+
+        # Params fuer CTE + LIMIT ist implizit + Params fuer aeusseres WHERE
+        final_params = all_params + all_params
+        cursor.execute(query, final_params)
         results = cursor.fetchall()
-        
+
         # Gruppiere und markiere Backup-Status
         grouped = defaultdict(list)
         for row in results:
-            key = f"{row[2]}{row[3] or ''}_{row[4]}"  # filename_extension_size
-            
+            ext = row[3] or ''
+            key = f"{row[2]}{ext}_{row[4]}"  # filename + extension + size
+
             file_info = {
                 'id': row[0],
                 'path': row[1],
@@ -196,7 +200,7 @@ class DuplicateScanThread(QThread):
                 'total_size': row[8],
                 'drive': row[9],
                 'is_backup': self.is_backup_path(row[1], backup_patterns),
-                'full_path': os.path.join(row[1], f"{row[2]}{row[3] or ''}")
+                'full_path': os.path.join(row[1], f"{row[2]}{ext}")
             }
             grouped[key].append(file_info)
         
@@ -226,7 +230,7 @@ class DuplicateScanThread(QThread):
             dr.name as drive,
             COUNT(f.id) as file_count,
             SUM(f.size) as total_size,
-            GROUP_CONCAT(f.filename || COALESCE(e.name, '') || '_' || f.size) as file_signatures
+            GROUP_CONCAT(f.filename || CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END || '_' || COALESCE(f.size, 0)) as file_signatures
         FROM directories d
         JOIN drives dr ON d.drive_id = dr.id
         LEFT JOIN files f ON f.directory_id = d.id
@@ -315,6 +319,9 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Erweiterter Duplikat-Manager")
         self.setGeometry(100, 100, 1400, 900)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'duplicate_advanced.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
@@ -610,11 +617,12 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
             total_waste += waste
             group_item.setToolTip(3, f"Verschwendet: {self.format_size(waste)}")
             
-            # Färbe Gruppe
+            # Faerbe Gruppe (dunkles Orange, lesbar auf dunklem Theme)
             for col in range(6):
-                group_item.setBackground(col, QtGui.QColor(255, 240, 200))
-            
-            # Füge Dateien hinzu
+                group_item.setBackground(col, QtGui.QColor(80, 60, 20))
+                group_item.setForeground(col, QtGui.QColor(255, 200, 100))
+
+            # Fuege Dateien hinzu
             for file in group:
                 file_item = QtWidgets.QTreeWidgetItem(group_item)
                 file_item.setText(0, f"{file['filename']}{file['extension'] or ''}")
@@ -622,11 +630,11 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
                 file_item.setText(2, file['drive'])
                 file_item.setText(3, self.format_size(file['size']))
                 file_item.setText(4, file['modified'] or "")
-                
+
                 if file['is_backup']:
                     file_item.setText(5, "BACKUP")
                     for col in range(6):
-                        file_item.setForeground(col, QtGui.QColor(0, 100, 200))
+                        file_item.setForeground(col, QtGui.QColor(100, 180, 255))
                         file_item.setFont(col, QtGui.QFont("", -1, QtGui.QFont.Bold))
                 else:
                     file_item.setText(5, "Normal")
@@ -665,11 +673,12 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
             group_item.setText(3, self.format_size(group_size))
             total_size += group_size
             
-            # Färbe Gruppe
+            # Faerbe Gruppe (dunkles Blau, lesbar auf dunklem Theme)
             for col in range(6):
-                group_item.setBackground(col, QtGui.QColor(200, 240, 255))
-            
-            # Füge Ordner hinzu
+                group_item.setBackground(col, QtGui.QColor(20, 50, 80))
+                group_item.setForeground(col, QtGui.QColor(100, 200, 255))
+
+            # Fuege Ordner hinzu
             for folder in group:
                 folder_item = QtWidgets.QTreeWidgetItem(group_item)
                 folder_item.setText(0, folder['path'])
@@ -677,11 +686,11 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
                 folder_item.setText(2, str(folder['file_count']))
                 folder_item.setText(3, self.format_size(folder['size'] or 0))
                 folder_item.setText(4, f"{folder['similarity']:.1f}%")
-                
+
                 if folder['is_backup']:
                     folder_item.setText(5, "BACKUP")
                     for col in range(6):
-                        folder_item.setForeground(col, QtGui.QColor(0, 100, 200))
+                        folder_item.setForeground(col, QtGui.QColor(100, 180, 255))
                         folder_item.setFont(col, QtGui.QFont("", -1, QtGui.QFont.Bold))
                 else:
                     folder_item.setText(5, "Normal")

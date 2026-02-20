@@ -549,6 +549,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Dateiscanner GUI")
         self.setGeometry(300, 200, 850, 650) # Etwas größer
+        _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons', 'gui_main.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         self.scan_worker = None
         self.scan_process = None
         self.integrity_process = None

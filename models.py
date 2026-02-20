@@ -179,7 +179,10 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_files_directory ON files (directory_id)",
                 "CREATE INDEX IF NOT EXISTS idx_files_size ON files (size)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_extensions_name ON extensions (name)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename)"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename)",
+                "CREATE INDEX IF NOT EXISTS idx_files_hash ON files (hash)",
+                "CREATE INDEX IF NOT EXISTS idx_extensions_category ON extensions (category)",
+                "CREATE INDEX IF NOT EXISTS idx_files_name_ext_size ON files (filename, extension_id, size)"
             ]
             
             for idx_sql in indices:

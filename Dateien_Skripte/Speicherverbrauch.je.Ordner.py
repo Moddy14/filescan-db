@@ -3,7 +3,7 @@ import sys
 import os
 import csv
 import sqlite3
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 
 def convert_size(size_bytes, unit):
     """
@@ -59,6 +59,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Dateien je Ordner - Übersicht")
         self.resize(900, 650)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'disk_usage.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)

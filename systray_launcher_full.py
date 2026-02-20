@@ -19,7 +19,6 @@ import logging
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(PROJECT_DIR, "Dateien.db")
 SCRIPTS_DIR = os.path.join(PROJECT_DIR, "Dateien_Skripte")
-NSSM_SERVICE_NAME = "DateiScannerWatchdog"
 
 # Setup logging: Rotierender File-Logger (pythonw.exe hat kein stdout)
 try:
@@ -95,7 +94,8 @@ def _extract_exe_icon(exe_path, icon_index=0, size=64):
 
 
 def create_icon():
-    """Erstellt das Tray-Icon (Windows Explorer Icon)."""
+    """Erstellt das Tray-Icon (Windows Explorer Icon bevorzugt)."""
+    # 1. Windows Explorer Icon
     try:
         explorer_path = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'explorer.exe')
         img = _extract_exe_icon(explorer_path, icon_index=0, size=64)
@@ -105,7 +105,18 @@ def create_icon():
     except Exception as e:
         logger.warning(f"Explorer-Icon Extraktion fehlgeschlagen: {e}")
 
-    # Fallback: einfaches Icon
+    # 2. Fallback: eigenes generiertes Icon
+    icon_path = os.path.join(PROJECT_DIR, 'icons', 'systray.ico')
+    if os.path.exists(icon_path):
+        try:
+            img = Image.open(icon_path)
+            img = img.resize((64, 64), Image.LANCZOS)
+            logger.info("Eigenes Systray-Icon geladen")
+            return img
+        except Exception as e:
+            logger.warning(f"Eigenes Icon konnte nicht geladen werden: {e}")
+
+    # 3. Fallback: einfaches Icon
     logger.info("Verwende Fallback-Icon")
     image = Image.new('RGBA', (64, 64), (0, 120, 215, 255))
     dc = ImageDraw.Draw(image)
@@ -218,90 +229,35 @@ def on_export(icon, item):
     else:
         logger.warning("Export nicht verfügbar")
 
-def _is_nssm_service_installed():
-    """Prüft ob der NSSM-Dienst installiert ist."""
-    try:
-        r = subprocess.run(
-            ['sc', 'query', NSSM_SERVICE_NAME],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-def _get_nssm_service_state():
-    """Gibt den Status des NSSM-Dienstes zurück ('RUNNING', 'STOPPED', 'PAUSED', oder None)."""
-    try:
-        r = subprocess.run(
-            ['sc', 'query', NSSM_SERVICE_NAME],
-            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        for line in r.stdout.split('\n'):
-            if 'STATE' in line:
-                if 'RUNNING' in line: return 'RUNNING'
-                if 'STOPPED' in line: return 'STOPPED'
-                if 'PAUSED' in line: return 'PAUSED'
-    except Exception:
-        pass
-    return None
-
 def on_watchdog_start(icon, item):
-    """Startet den Watchdog-Service (NSSM-Dienst bevorzugt, Fallback auf direkten Start)."""
+    """Startet den Watchdog-Service (delegiert an watchdog_control.py)."""
     def _start():
         try:
-            if _is_nssm_service_installed():
-                state = _get_nssm_service_state()
-                if state == 'RUNNING':
-                    icon.notify("Watchdog läuft bereits", "Scanner")
-                    return
-                logger.info("Starte Watchdog über NSSM-Dienst...")
-                r = subprocess.run(
-                    ['sc', 'start', NSSM_SERVICE_NAME],
-                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                if r.returncode == 0:
-                    icon.notify("Watchdog-Dienst gestartet", "Scanner")
-                    logger.info("NSSM-Dienst erfolgreich gestartet")
-                else:
-                    logger.warning(f"sc start fehlgeschlagen: {r.stderr.strip()}")
-                    icon.notify("Dienst-Start fehlgeschlagen", "Fehler")
+            if find_watchdog_pid() is not None:
+                icon.notify("Watchdog läuft bereits", "Scanner")
+                return
+            logger.info("Starte Watchdog-Service...")
+            if start_watchdog():
+                icon.notify("Watchdog-Service gestartet", "Scanner")
             else:
-                logger.info("Kein NSSM-Dienst, starte Watchdog direkt...")
-                if start_watchdog():
-                    icon.notify("Watchdog-Service gestartet", "Scanner")
-                else:
-                    icon.notify("Watchdog-Start fehlgeschlagen", "Fehler")
+                icon.notify("Watchdog-Start fehlgeschlagen", "Fehler")
         except Exception as e:
             logger.error(f"Fehler beim Watchdog-Start: {e}")
             icon.notify("Fehler beim Watchdog-Start", "Fehler")
     threading.Thread(target=_start, daemon=True).start()
 
 def on_watchdog_stop(icon, item):
-    """Stoppt den Watchdog-Service (NSSM-Dienst bevorzugt, Fallback auf watchdog_control)."""
+    """Stoppt den Watchdog-Service (delegiert an watchdog_control.py)."""
     def _stop():
         try:
-            if _is_nssm_service_installed():
-                state = _get_nssm_service_state()
-                if state in ('STOPPED', None):
-                    icon.notify("Watchdog ist bereits gestoppt", "Scanner")
-                    return
-                logger.info("Stoppe Watchdog über NSSM-Dienst...")
-                r = subprocess.run(
-                    ['sc', 'stop', NSSM_SERVICE_NAME],
-                    capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                if r.returncode == 0:
-                    icon.notify("Watchdog-Dienst gestoppt", "Scanner")
-                    logger.info("NSSM-Dienst erfolgreich gestoppt")
-                else:
-                    logger.warning(f"sc stop fehlgeschlagen: {r.stderr.strip()}")
-                    icon.notify("Dienst-Stop fehlgeschlagen", "Fehler")
+            if find_watchdog_pid() is None:
+                icon.notify("Watchdog ist bereits gestoppt", "Scanner")
+                return
+            logger.info("Stoppe Watchdog-Service...")
+            if stop_watchdog():
+                icon.notify("Watchdog-Service gestoppt", "Scanner")
             else:
-                logger.info("Kein NSSM-Dienst, stoppe Watchdog direkt...")
-                if stop_watchdog():
-                    icon.notify("Watchdog-Service gestoppt", "Scanner")
-                else:
-                    icon.notify("Watchdog nicht gefunden oder bereits gestoppt", "Scanner")
+                icon.notify("Watchdog-Stop fehlgeschlagen", "Fehler")
         except Exception as e:
             logger.error(f"Fehler beim Watchdog-Stop: {e}")
             icon.notify("Fehler beim Watchdog-Stop", "Fehler")

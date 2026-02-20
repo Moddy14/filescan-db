@@ -311,6 +311,9 @@ class DuplicateFolderManager(QtWidgets.QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Duplikat-Ordner-Manager")
         self.setGeometry(200, 200, 1200, 800)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'duplicate_folders.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)

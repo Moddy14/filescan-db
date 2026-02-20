@@ -288,6 +288,9 @@ class FastFolderDuplicateFinder(QtWidgets.QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Schneller Ordner-Duplikat-Finder (SQL-optimiert)")
         self.setGeometry(100, 100, 1300, 800)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'duplicate_fast_folder.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)

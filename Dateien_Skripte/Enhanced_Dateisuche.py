@@ -37,11 +37,11 @@ class BooleanSearchParser:
             return "", []
             
         try:
-            sql_expr, params = self.parse_expression(tokens)
+            sql_expr, params, _remaining = self.parse_expression(tokens)
             return sql_expr, params
         except Exception as e:
             # Fallback: einfache LIKE-Suche wenn Boolean-Parsing fehlschlägt
-            return "files.filename LIKE ?", [f"%{search_string}%"]
+            return "(files.filename || CASE WHEN extensions.name IS NULL OR extensions.name = '[none]' THEN '' ELSE extensions.name END) LIKE ?", [f"%{search_string}%"]
     
     def tokenize(self, text):
         """Tokenisiert den Suchstring"""
@@ -68,19 +68,22 @@ class BooleanSearchParser:
         return left_expr, left_params, tokens
     
     def parse_and(self, tokens):
-        """Parst AND-Verknüpfungen (mittlere Priorität)"""
+        """Parst AND-Verknüpfungen (mittlere Priorität)
+
+        NOT wird als implizites AND NOT behandelt:
+        'backup NOT temp' = 'backup AND NOT temp'
+        """
         left_expr, left_params, tokens = self.parse_not(tokens)
-        
-        while tokens and (tokens[0].upper() == 'AND' or 
-                         (tokens[0].upper() not in ['OR', 'AND', 'NOT', ')'] and tokens[0] != ')')):
-            # Implizites AND wenn kein Operator angegeben
+
+        while tokens and tokens[0].upper() not in ['OR', ')']:
+            # Explizites AND entfernen, NOT bleibt (wird von parse_not verarbeitet)
             if tokens[0].upper() == 'AND':
-                tokens.pop(0)  # Entferne 'AND'
-            
+                tokens.pop(0)
+
             right_expr, right_params, tokens = self.parse_not(tokens)
             left_expr = f"({left_expr} AND {right_expr})"
             left_params.extend(right_params)
-            
+
         return left_expr, left_params, tokens
     
     def parse_not(self, tokens):
@@ -110,11 +113,11 @@ class BooleanSearchParser:
         elif token.startswith('"') and token.endswith('"'):
             # Exakte Phrase (ohne Anführungszeichen)
             phrase = token[1:-1]
-            return "files.filename LIKE ?", [f"%{phrase}%"], tokens
-            
+            return "(files.filename || CASE WHEN extensions.name IS NULL OR extensions.name = '[none]' THEN '' ELSE extensions.name END) LIKE ?", [f"%{phrase}%"], tokens
+
         else:
-            # Einzelnes Wort
-            return "files.filename LIKE ?", [f"%{token}%"], tokens
+            # Einzelnes Wort — suche in filename UND filename+extension
+            return "(files.filename || CASE WHEN extensions.name IS NULL OR extensions.name = '[none]' THEN '' ELSE extensions.name END) LIKE ?", [f"%{token}%"], tokens
 
 # Helper functions (aus der ursprünglichen Datei übernommen)
 def open_file_with_default_app(filepath):
@@ -184,7 +187,7 @@ class EnhancedSearchWorker(QThread):
                     files.hash,
                     files.created_date,
                     files.modified_date,
-                    directories.full_path || '/' || files.filename || COALESCE(extensions.name, '') as full_file_path
+                    directories.full_path || '/' || files.filename || CASE WHEN extensions.name IS NULL OR extensions.name = '[none]' THEN '' ELSE extensions.name END as full_file_path
                 FROM files
                 JOIN directories ON files.directory_id = directories.id
                 JOIN drives ON directories.drive_id = drives.id
@@ -304,6 +307,9 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Erweiterte Dateisuche - Optimierte DB-Struktur")
         self.resize(1400, 900)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'search.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         self.db_path = db_path
         self.conn = None
         self.worker = None
@@ -833,21 +839,23 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
         sql_parts = []
         params = []
         
+        # Suche in filename UND filename+extension, damit z.B. "bericht.pdf" gefunden wird
+        full_name_expr = "(files.filename || CASE WHEN extensions.name IS NULL OR extensions.name = '[none]' THEN '' ELSE extensions.name END)"
+
         for term in terms:
             if term['is_first']:
-                # Erster Begriff ohne Operator
-                sql_parts.append("files.filename LIKE ?")
-                params.append(f"%{term['pattern']}%")
+                sql_parts.append(f"({full_name_expr} LIKE ? OR files.filename LIKE ?)")
+                params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
             else:
                 if term['operator'] == 'NOT':
-                    sql_parts.append("AND files.filename NOT LIKE ?")
-                    params.append(f"%{term['pattern']}%")
+                    sql_parts.append(f"AND ({full_name_expr} NOT LIKE ? AND files.filename NOT LIKE ?)")
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 elif term['operator'] == 'OR':
-                    sql_parts.append("OR files.filename LIKE ?")
-                    params.append(f"%{term['pattern']}%")
+                    sql_parts.append(f"OR ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 else:  # AND
-                    sql_parts.append("AND files.filename LIKE ?")
-                    params.append(f"%{term['pattern']}%")
+                    sql_parts.append(f"AND ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
         
         if sql_parts:
             # Gesamten Ausdruck in Klammern setzen
@@ -861,7 +869,7 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
         self.path_input.clear()
         self.clear_search_terms()
         self.toggle_all_items(self.drive_list, False)
-        self.toggle_all_items(self.extension_list, False)
+        self.extension_input.clear()
         self.toggle_all_items(self.category_list, False)
         self.size_value1.setValue(0)
         self.size_value2.setValue(0)

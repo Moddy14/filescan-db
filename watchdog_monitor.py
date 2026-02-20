@@ -330,6 +330,12 @@ class FSHandler(FileSystemEventHandler):
                     dest_ext = dest_ext if dest_ext else '[none]'
                     dest_ext_id = self.db.get_or_create_extension(dest_ext)
                     
+                    # Loesche evtl. existierende Zieldatei (Rename-Pattern: temp -> final)
+                    self.db.cursor.execute(
+                        "DELETE FROM files WHERE directory_id = ? AND filename = ? AND id != ?",
+                        (dest_dir_id, dest_filename_only, file_id)
+                    )
+
                     # Update die Datei
                     self.db.cursor.execute(
                         "UPDATE files SET directory_id = ?, filename = ?, extension_id = ? WHERE id = ?",

@@ -91,11 +91,11 @@ class DuplicateScanThread(QThread):
                     ORDER BY total_size DESC
                     LIMIT ?
                 )
-                SELECT 
+                SELECT
                     f.id,
                     d.full_path,
                     f.filename,
-                    e.name as extension,
+                    CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END as extension,
                     f.size,
                     f.hash,
                     f.modified_date,
@@ -126,19 +126,19 @@ class DuplicateScanThread(QThread):
                     ORDER BY total_size DESC
                     LIMIT ?
                 )
-                SELECT 
+                SELECT
                     f.id,
                     d.full_path,
                     f.filename,
-                    e.name as extension,
+                    CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END as extension,
                     f.size,
                     f.hash,
                     f.modified_date,
                     dg.dup_count,
-                    f.filename || COALESCE(e.name, '') as group_key
+                    f.filename || CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END || '_' || CAST(f.size AS TEXT) as group_key
                 FROM duplicate_groups dg
-                JOIN files f ON f.filename = dg.filename 
-                    AND f.extension_id IS NOT DISTINCT FROM dg.extension_id
+                JOIN files f ON f.filename = dg.filename
+                    AND f.extension_id IS dg.extension_id
                     AND f.size = dg.size
                 JOIN directories d ON f.directory_id = d.id
                 LEFT JOIN extensions e ON f.extension_id = e.id
@@ -196,6 +196,9 @@ class FastDuplicateFinder(QtWidgets.QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Schneller Duplikat-Finder")
         self.setGeometry(100, 100, 1200, 800)
+        _icon = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', 'duplicate_fast.ico')
+        if os.path.exists(_icon):
+            self.setWindowIcon(QtGui.QIcon(_icon))
         
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)

@@ -13,8 +13,29 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SERVICE_NAME = "DateiScannerWatchdog"
+
+
+def _is_nssm_service_running():
+    """Prueft ob der Watchdog als Windows-Dienst (NSSM) laeuft."""
+    try:
+        result = subprocess.run(
+            ['sc', 'query', SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        )
+        return 'RUNNING' in result.stdout.upper()
+    except Exception:
+        return False
+
+
 def find_watchdog_pid():
-    """Findet die PID des laufenden Watchdog-Services."""
+    """Findet die PID des laufenden Watchdog-Services.
+
+    Prueft sowohl Python-Prozesse als auch den Windows-Dienst (NSSM).
+    Gibt die PID zurueck oder -1 wenn nur der Dienst laeuft (PID unbekannt).
+    """
+    # 1. Suche nach Python-Prozess
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             cmdline = proc.info.get('cmdline', [])
@@ -22,54 +43,109 @@ def find_watchdog_pid():
                 return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+
+    # 2. Pruefe Windows-Dienst (NSSM)
+    if _is_nssm_service_running():
+        logger.info(f"[Watchdog] Dienst '{SERVICE_NAME}' laeuft als NSSM-Service")
+        return -1  # Dienst laeuft, aber PID nicht direkt verfuegbar
+
     return None
 
+
 def stop_watchdog():
-    """Stoppt den Watchdog-Service sanft."""
+    """Stoppt den Watchdog-Service sanft.
+
+    Unterstuetzt sowohl direkte Python-Prozesse als auch NSSM-Dienste.
+    """
     pid = find_watchdog_pid()
-    if pid:
-        try:
-            # Versuche sanftes Beenden
-            proc = psutil.Process(pid)
-            proc.terminate()
-            
-            # Warte bis zu 5 Sekunden auf Beendigung
-            gone, alive = psutil.wait_procs([proc], timeout=5)
-            
-            if alive:
-                # Erzwinge Beendigung wenn nötig
-                for p in alive:
-                    p.kill()
-                logger.warning(f"Watchdog-Service (PID {pid}) musste erzwungen beendet werden")
-            else:
-                logger.info(f"Watchdog-Service (PID {pid}) erfolgreich gestoppt")
-            
-            return True
-        except Exception as e:
-            logger.error(f"Fehler beim Stoppen des Watchdog-Service: {e}")
-            return False
-    else:
-        logger.info("Watchdog-Service läuft nicht")
+
+    if pid is None:
+        logger.info("Watchdog-Service laeuft nicht")
         return True
 
-def start_watchdog():
-    """Startet den Watchdog-Service."""
-    if find_watchdog_pid():
-        logger.info("Watchdog-Service läuft bereits")
+    # Fall 1: NSSM-Dienst (pid == -1)
+    if pid == -1:
+        try:
+            logger.info(f"[Watchdog] Stoppe NSSM-Dienst '{SERVICE_NAME}'...")
+            result = subprocess.run(
+                ['sc', 'stop', SERVICE_NAME],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            # Warte bis Dienst gestoppt
+            for _ in range(10):
+                time.sleep(1)
+                if not _is_nssm_service_running():
+                    logger.info(f"[Watchdog] NSSM-Dienst '{SERVICE_NAME}' gestoppt")
+                    return True
+            logger.warning(f"[Watchdog] NSSM-Dienst konnte nicht innerhalb von 10s gestoppt werden")
+            return False
+        except Exception as e:
+            logger.error(f"[Watchdog] Fehler beim Stoppen des NSSM-Dienstes: {e}")
+            return False
+
+    # Fall 2: Direkter Python-Prozess
+    try:
+        proc = psutil.Process(pid)
+        proc.terminate()
+
+        gone, alive = psutil.wait_procs([proc], timeout=5)
+
+        if alive:
+            for p in alive:
+                p.kill()
+            logger.warning(f"Watchdog-Service (PID {pid}) musste erzwungen beendet werden")
+        else:
+            logger.info(f"Watchdog-Service (PID {pid}) erfolgreich gestoppt")
+
         return True
-    
+    except Exception as e:
+        logger.error(f"Fehler beim Stoppen des Watchdog-Service: {e}")
+        return False
+
+def start_watchdog():
+    """Startet den Watchdog-Service.
+
+    Versucht zuerst den NSSM-Dienst zu starten, dann Fallback auf direkten Start.
+    """
+    if find_watchdog_pid():
+        logger.info("Watchdog-Service laeuft bereits")
+        return True
+
+    # Versuch 1: NSSM-Dienst starten
+    try:
+        result = subprocess.run(
+            ['sc', 'query', SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        )
+        if result.returncode == 0 and 'STOPPED' in result.stdout.upper():
+            logger.info(f"[Watchdog] Starte NSSM-Dienst '{SERVICE_NAME}'...")
+            subprocess.run(
+                ['sc', 'start', SERVICE_NAME],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            for _ in range(10):
+                time.sleep(1)
+                if _is_nssm_service_running():
+                    logger.info(f"[Watchdog] NSSM-Dienst '{SERVICE_NAME}' gestartet")
+                    return True
+            logger.warning("[Watchdog] NSSM-Dienst konnte nicht gestartet werden, versuche direkten Start")
+    except Exception as e:
+        logger.debug(f"[Watchdog] NSSM-Start fehlgeschlagen: {e}")
+
+    # Versuch 2: Direkter Start als Python-Prozess
     try:
         script_path = os.path.join(os.path.dirname(__file__), 'watchdog_service.py')
         if os.path.exists(script_path):
-            # Starte im Hintergrund mit pythonw
             subprocess.Popen([sys.executable.replace('python.exe', 'pythonw.exe'), script_path],
-                           cwd=os.path.dirname(__file__),
-                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            
-            # Warte kurz und prüfe ob gestartet
+                             cwd=os.path.dirname(__file__),
+                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+
             time.sleep(2)
             if find_watchdog_pid():
-                logger.info("Watchdog-Service erfolgreich gestartet")
+                logger.info("Watchdog-Service erfolgreich gestartet (direkter Prozess)")
                 return True
             else:
                 logger.error("Watchdog-Service konnte nicht gestartet werden")
