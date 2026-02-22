@@ -17,6 +17,7 @@ import sqlite3
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from drive_alias_detector import normalize_path_with_aliases, get_drive_mapping
+from scan_lock import should_fs_write
 
 # Globale Variable für Drive-Mappings (wird einmal geladen)
 _drive_mappings = None
@@ -70,6 +71,12 @@ except Exception as models_ex:
     # *** ENTFERNT: Debug-Logging im Fehlerfall ***
     # with open(DEBUG_FILE, "a") as f: f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - watchdog_monitor: EXCEPTION importing from models: {models_ex}\n")
     raise # Fehler weiter werfen
+
+# Prozessweiter Lock für DB-Reinitialisierung:
+# Verhindert, dass mehrere FSHandler-Threads gleichzeitig close() + reinit() aufrufen
+# (führt sonst zu "Recursive use of cursors" / "Cannot operate on closed database")
+import threading as _threading
+_reinit_lock = _threading.Lock()
 
 
 # --- NEU: Listen für zu ignorierende Pfade und Dateien ---
@@ -137,65 +144,89 @@ class FSHandler(FileSystemEventHandler):
         self._initialize_db()
 
     def _initialize_db(self):
-        """Initialisiert die DB-Verbindung und holt die drive_id."""
-        try:
-            self.db = get_db_instance() # Verwendet Standardpfad aus utils
-            if self.db:
+        """Initialisiert die DB-Verbindung und holt die drive_id.
+        Retry-Loop schützt gegen Race Condition zwischen get_db_instance() und get_or_create_drive().
+        """
+        last_error = None
+        for attempt in range(5):
+            try:
+                self.db = get_db_instance()
+                if not self.db:
+                    logger.error("[Watchdog-Fehler] Konnte keine DB-Instanz erhalten.")
+                    self.db = None
+                    self.drive_id = None
+                    return
                 self.drive_id = self.db.get_or_create_drive(self.drive_name)
                 if self.drive_id is None:
                     logger.error(f"[Watchdog-Fehler] Konnte drive_id für {self.drive_name} nicht ermitteln.")
-            else:
-                 logger.error("[Watchdog-Fehler] Konnte keine DB-Instanz erhalten.")
-        except Exception as e:
-            logger.error(f"[Watchdog-Fehler] Kritischer Fehler bei DB-Initialisierung: {e}")
-            # In diesem Fall kann der Handler nicht richtig arbeiten
-            self.db = None
-            self.drive_id = None
+                return  # Erfolg
+            except Exception as e:
+                last_error = e
+                if "closed database" in str(e).lower() and attempt < 4:
+                    time.sleep(0.1 * (attempt + 1))  # Kurz warten, dann erneut versuchen
+                    continue
+                break
+
+        logger.error(f"[Watchdog-Fehler] Kritischer Fehler bei DB-Initialisierung: {last_error}")
+        self.db = None
+        self.drive_id = None
 
     def _reinitialize_db_if_needed(self):
-        """Prüft, ob eine DB-Verbindung besteht und versucht ggf. neu zu initialisieren."""
-        # Erste Prüfung: Sind DB und drive_id vorhanden?
-        if self.db is None or self.drive_id is None:
-            logger.info("[Watchdog] DB-Instanz oder drive_id fehlt. Versuche Wiederherstellung...")
-            self._initialize_db()
-            return self.db is not None and self.drive_id is not None
-        
-        # Zweite Prüfung: Ist die DB-Verbindung noch aktiv?
-        try:
-            self.db.cursor.execute("SELECT 1")
-            result = self.db.cursor.fetchone()
-            if result and result[0] == 1:
-                return True
-        except Exception as e:
-            logger.warning(f"[Watchdog] DB-Verbindung unterbrochen: {e}. Versuche Neuinitialisierung...")
-            
-        # Verbindung ist unterbrochen - Neuinitialisierung
-        max_retries = 3
-        for attempt in range(max_retries):
+        """Prüft, ob eine DB-Verbindung besteht und versucht ggf. neu zu initialisieren.
+
+        Verwendet _reinit_lock damit niemals zwei FSHandler-Threads gleichzeitig
+        close() + reinit() aufrufen → verhindert "Recursive use of cursors" und
+        "Cannot operate on closed database".
+        """
+        # Schnellpfad ohne Lock: Wenn alles ok, sofort zurück
+        if self.db is not None and self.drive_id is not None:
             try:
-                time.sleep(1)  # Kurze Pause
-                if hasattr(self.db, 'conn'):
-                    try:
-                        self.db.conn.close()
-                    except:
-                        pass
-                
-                self.db = None
-                self._initialize_db()
-                
-                if self.db is not None and self.drive_id is not None:
-                    # Test der neuen Verbindung
-                    self.db.cursor.execute("SELECT 1")
-                    result = self.db.cursor.fetchone()
-                    if result and result[0] == 1:
+                # conn.execute() ist thread-sicherer als cursor.execute() da kein
+                # geteilter Cursor-Zustand verwendet wird (jede Verbindung hat ihren eigenen)
+                self.db.conn.execute("SELECT 1")
+                return True
+            except Exception as e:
+                logger.warning(f"[Watchdog] DB-Verbindung unterbrochen: {e}. Versuche Neuinitialisierung...")
+                # Fällt durch zum Lock-geschützten Reinitialisierungspfad
+
+        # Lock-geschützter Reinitialisierungspfad: Nur ein Thread auf einmal
+        with _reinit_lock:
+            # Doppelte Prüfung: Vielleicht hat ein anderer Thread schon reinitialisiert
+            if self.db is not None and self.drive_id is not None:
+                try:
+                    self.db.conn.execute("SELECT 1")
+                    return True  # Anderer Thread hat bereits wiederhergestellt
+                except Exception:
+                    pass  # Immer noch kaputt, wir machen weiter
+
+            if self.db is None or self.drive_id is None:
+                logger.info("[Watchdog] DB-Instanz oder drive_id fehlt. Versuche Wiederherstellung...")
+
+            # Verbindung ist unterbrochen - Neuinitialisierung
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    time.sleep(1)  # Kurze Pause
+                    if self.db is not None and hasattr(self.db, 'close'):
+                        try:
+                            self.db.close()  # DBManager.close() → setzt Singleton korrekt zurück
+                        except Exception:
+                            pass
+
+                    self.db = None
+                    self._initialize_db()
+
+                    if self.db is not None and self.drive_id is not None:
+                        # Test der neuen Verbindung
+                        self.db.conn.execute("SELECT 1")
                         logger.info(f"[Watchdog] DB-Verbindung erfolgreich wiederhergestellt (Versuch {attempt + 1}).")
                         return True
-                        
-            except Exception as reinit_ex:
-                logger.error(f"[Watchdog] Fehler bei DB-Wiederherstellung (Versuch {attempt + 1}): {reinit_ex}")
-        
-        logger.error("[Watchdog] Kritisch: DB-Verbindung konnte nicht wiederhergestellt werden.")
-        return False
+
+                except Exception as reinit_ex:
+                    logger.error(f"[Watchdog] Fehler bei DB-Wiederherstellung (Versuch {attempt + 1}): {reinit_ex}")
+
+            logger.error("[Watchdog] Kritisch: DB-Verbindung konnte nicht wiederhergestellt werden.")
+            return False
 
     # --- NEU: Hilfsfunktion zum Prüfen, ob ein Pfad ignoriert werden soll ---
     def _is_ignored(self, path):
@@ -244,6 +275,9 @@ class FSHandler(FileSystemEventHandler):
         # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
             return
+        if not should_fs_write():
+            logger.debug(f"[ScanLock] on_created übersprungen (Scan läuft): {event.src_path}")
+            return
 
         if not self._reinitialize_db_if_needed(): return
         try:
@@ -261,6 +295,9 @@ class FSHandler(FileSystemEventHandler):
         # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
             return
+        if not should_fs_write():
+            logger.debug(f"[ScanLock] on_modified übersprungen (Scan läuft): {event.src_path}")
+            return
 
         if not self._reinitialize_db_if_needed(): return
         try:
@@ -276,6 +313,9 @@ class FSHandler(FileSystemEventHandler):
         """Behandelt das Verschieben/Umbenennen von Dateien oder Verzeichnissen."""
         # *** NEU: Prüfung am Anfang (Quelle UND Ziel) ***
         if self._is_ignored(event.src_path) or self._is_ignored(event.dest_path):
+            return
+        if not should_fs_write():
+            logger.debug(f"[ScanLock] on_moved übersprungen (Scan läuft): {event.src_path}")
             return
 
         if not self._reinitialize_db_if_needed(): return
@@ -294,29 +334,98 @@ class FSHandler(FileSystemEventHandler):
                     src_dir = os.path.dirname(src_path)
                     dest_dir = os.path.dirname(dest_path)
                     
-                    # Finde die Datei in der optimierten Struktur
+                    # --- SMART SPLIT: Multi-Dot-Dateinamen korrekt behandeln ---
+                    # os.path.splitext("Second.Try.TEST.xml") → ("Second.Try.TEST", ".xml")
+                    # Aber DB könnte "Second.Try" + ".xml" gespeichert haben.
+                    # Strategie: Erst os.path.splitext versuchen, dann DB-basierter Fallback.
                     src_filename_only, src_ext = os.path.splitext(src_filename)
                     src_ext = src_ext if src_ext else '[none]'
+                    
+                    # DEBUG: Alle Rename-Details loggen
+                    logger.info(f"[Watchdog Move DEBUG] src_path={src_path}")
+                    logger.info(f"[Watchdog Move DEBUG] dest_path={dest_path}")
+                    logger.info(f"[Watchdog Move DEBUG] src_dir={src_dir}, src_filename_only={src_filename_only}, src_ext={src_ext}")
+                    logger.info(f"[Watchdog Move DEBUG] self.drive_id={self.drive_id}, self.drive_name={self.drive_name}")
+                    logger.info(f"[Watchdog Move DEBUG] DB-Query: drive_id={self.drive_id}, full_path={src_dir.replace(chr(92), '/')}")
                     
                     # Finde die alte directory_id
                     self.db.cursor.execute("SELECT id FROM directories WHERE drive_id = ? AND full_path = ?", (self.drive_id, src_dir.replace("\\", "/")))
                     src_dir_row = self.db.cursor.fetchone()
                     if not src_dir_row:
+                        # DEBUG: Zeige was in der DB für diesen Pfad existiert (ohne drive_id Filter)
+                        self.db.cursor.execute("SELECT id, drive_id, full_path FROM directories WHERE full_path = ?", (src_dir.replace("\\", "/"),))
+                        alt_row = self.db.cursor.fetchone()
+                        if alt_row:
+                            logger.warning(f"[Watchdog Move DEBUG] Pfad existiert aber mit anderer drive_id! DB: drive_id={alt_row[1]}, Watchdog: drive_id={self.drive_id}")
+                        else:
+                            logger.warning(f"[Watchdog Move DEBUG] Pfad existiert NICHT in DB: {src_dir.replace(chr(92), '/')}")
                         logger.warning(f"[Watchdog Move] Quell-Verzeichnis nicht gefunden: {src_dir}. Lege Ziel als neue Datei an.")
                         self._insert_or_update_file(dest_path)
                         return
                     src_dir_id = src_dir_row[0]
+                    logger.info(f"[Watchdog Move DEBUG] src_dir_id={src_dir_id}")
                     
                     # Finde Extension-ID
                     ext_id = self.db.get_or_create_extension(src_ext)
+                    logger.info(f"[Watchdog Move DEBUG] ext_id={ext_id} für '{src_ext}'")
                     
-                    # Finde die Datei
+                    # --- PHASE 1: Exakter Lookup (os.path.splitext) ---
                     self.db.cursor.execute(
                         "SELECT id FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ?",
                         (src_dir_id, src_filename_only, ext_id)
                     )
                     file_row = self.db.cursor.fetchone()
+                    
+                    # --- PHASE 2: Smart Fallback für Multi-Dot-Dateinamen ---
+                    if not file_row and '.' in src_filename_only:
+                        # src_filename_only enthält Punkte → könnte falsch gesplittet sein
+                        # Suche in DB: Welche Datei in diesem Ordner hat einen Namen,
+                        # der ein Präfix von src_filename ist?
+                        # z.B. src_filename="Second.Try.TEST.xml" → DB hat "Second.Try" + ".xml"
+                        logger.info(f"[Watchdog Move] Phase 2: Multi-Dot-Fallback für '{src_filename}'")
+                        
+                        # Hole alle Dateien in diesem Ordner deren Name ein Anfangsstück von src_filename_only ist
+                        self.db.cursor.execute(
+                            """SELECT f.id, f.filename, f.extension_id, e.name 
+                               FROM files f 
+                               JOIN extensions e ON f.extension_id = e.id 
+                               WHERE f.directory_id = ? 
+                               AND ? LIKE f.filename || '%'""",
+                            (src_dir_id, src_filename_only)
+                        )
+                        candidates = self.db.cursor.fetchall()
+                        
+                        if candidates:
+                            # Finde den besten Match: DB-filename + DB-extension muss dem
+                            # vollständigen src_filename entsprechen (oder ein gültiger Split sein)
+                            best_match = None
+                            for cand_id, cand_name, cand_ext_id, cand_ext in candidates:
+                                # Prüfe: cand_name + "." + rest + cand_ext == src_filename ?
+                                # Also: src_filename muss mit cand_name beginnen und mit cand_ext enden
+                                if src_filename.lower().startswith(cand_name.lower()) and src_filename.lower().endswith(cand_ext.lower()):
+                                    # Gültiger Kandidat! Bevorzuge längsten DB-filename (genauester Match)
+                                    if best_match is None or len(cand_name) > len(best_match[1]):
+                                        best_match = (cand_id, cand_name, cand_ext_id, cand_ext)
+                            
+                            if best_match:
+                                file_row = (best_match[0],)
+                                # Korrigiere auch ext_id für den gefundenen Eintrag
+                                ext_id = best_match[2]
+                                logger.info(f"[Watchdog Move] Phase 2 TREFFER: DB-filename='{best_match[1]}', DB-ext='{best_match[3]}', file_id={best_match[0]}")
+                            else:
+                                logger.info(f"[Watchdog Move] Phase 2: {len(candidates)} Kandidaten, aber kein exakter Match")
+                        else:
+                            logger.info(f"[Watchdog Move] Phase 2: Keine Kandidaten gefunden")
+                    
                     if not file_row:
+                        # Weder Phase 1 noch Phase 2 hat die Datei gefunden
+                        self.db.cursor.execute(
+                            "SELECT id, filename, extension_id FROM files WHERE directory_id = ? AND filename LIKE ?",
+                            (src_dir_id, f"%{src_filename_only[:10]}%")
+                        )
+                        similar = self.db.cursor.fetchall()
+                        logger.warning(f"[Watchdog Move DEBUG] Datei nicht gefunden mit: dir_id={src_dir_id}, filename='{src_filename_only}', ext_id={ext_id}")
+                        logger.warning(f"[Watchdog Move DEBUG] Ähnliche Dateien in diesem Ordner: {similar[:5]}")
                         logger.warning(f"[Watchdog Move] Datei nicht in DB gefunden: {src_path}. Lege Ziel als neue Datei an.")
                         self._insert_or_update_file(dest_path)
                         return
@@ -325,15 +434,19 @@ class FSHandler(FileSystemEventHandler):
                     # Erstelle/hole neues Zielverzeichnis
                     dest_dir_id = self.db.get_or_create_directory_optimized(self.drive_id, dest_dir.replace("\\", "/"))
                     
-                    # Parse neuen Dateinamen
+                    # --- SMART SPLIT für Ziel-Dateiname ---
+                    # Gleiche Logik: os.path.splitext für den Dest-Filename,
+                    # aber der UNIQUE Index ist auf (directory_id, filename),
+                    # also muss filename konsistent sein.
                     dest_filename_only, dest_ext = os.path.splitext(dest_filename)
                     dest_ext = dest_ext if dest_ext else '[none]'
                     dest_ext_id = self.db.get_or_create_extension(dest_ext)
                     
                     # Loesche evtl. existierende Zieldatei (Rename-Pattern: temp -> final)
+                    # WICHTIG: extension_id mit prüfen um keine falschen Dateien zu löschen!
                     self.db.cursor.execute(
-                        "DELETE FROM files WHERE directory_id = ? AND filename = ? AND id != ?",
-                        (dest_dir_id, dest_filename_only, file_id)
+                        "DELETE FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ? AND id != ?",
+                        (dest_dir_id, dest_filename_only, dest_ext_id, file_id)
                     )
 
                     # Update die Datei
@@ -347,7 +460,8 @@ class FSHandler(FileSystemEventHandler):
                     # REAL-TIME FIX: Force WAL Checkpoint für sofortige Sichtbarkeit
                     self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     
-                    logger.info(f"[Watchdog Move] Datei verschoben/umbenannt: {src_path} -> {dest_path}")
+                    logger.info(f"[Watchdog Move] ✅ Datei verschoben/umbenannt: {src_path} -> {dest_path}")
+                    logger.info(f"[Watchdog Move DEBUG] UPDATE: file_id={file_id}, new_dir_id={dest_dir_id}, new_filename='{dest_filename_only}', new_ext_id={dest_ext_id}")
 
             except sqlite3.Error as e:
                 logger.error(f"[Watchdog Move DB-Fehler] Transaktion fehlgeschlagen für {src_path} -> {dest_path}: {e}. Rollback wird durchgeführt.")
@@ -362,6 +476,9 @@ class FSHandler(FileSystemEventHandler):
         """Behandelt das Löschen von Dateien oder Verzeichnissen."""
         # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
+            return
+        if not should_fs_write():
+            logger.debug(f"[ScanLock] on_deleted übersprungen (Scan läuft): {event.src_path}")
             return
 
         if not self._reinitialize_db_if_needed(): return
