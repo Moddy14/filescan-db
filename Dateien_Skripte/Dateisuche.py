@@ -87,6 +87,7 @@ class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
 
 class SearchWorker(QThread):
     finished = pyqtSignal(list, int, bool)  # filtered_results, result_count, warnung_gesetzt
+    debug_log = pyqtSignal(str)  # Debug-Nachrichten
 
     def __init__(self, db_path, filter_args):
         super().__init__()
@@ -95,6 +96,9 @@ class SearchWorker(QThread):
 
     def run(self):
         import sqlite3, datetime, os
+        self.debug_log.emit("=" * 60)
+        self.debug_log.emit(f"🔍 SUCHE GESTARTET - {datetime.datetime.now().strftime('%H:%M:%S')}")
+        self.debug_log.emit(f"📂 Datenbank: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys = ON")  # Foreign Keys aktivieren
         (
@@ -107,6 +111,17 @@ class SearchWorker(QThread):
         name_filter_active = bool(active_name_query_indices)
         size_filter_active = (size_op != "Egal")
         date_filter_active = (date_op != "Egal")
+        
+        # DEBUG: Eingaben loggen
+        self.debug_log.emit(f"\n📋 EINGABEN:")
+        self.debug_log.emit(f"   Pfad-Suche: '{path_query}' (aktiv: {path_filter_active}, min_len={min_len})")
+        for i, q in enumerate(name_queries):
+            op = name_ops[i] if i < len(name_ops) else "-"
+            active = i in active_name_query_indices
+            self.debug_log.emit(f"   Name[{i}]: '{q}' (aktiv: {active}, Operator: {op})")
+        self.debug_log.emit(f"   Größe: {size_op} {size_val1} {size_unit}" + (f" bis {size_val2}" if size_op == "Zwischen" else ""))
+        self.debug_log.emit(f"   Datum: {date_op}" + (f" {qdate_val1}" if date_op != "Egal" else ""))
+        self.debug_log.emit(f"\n   ⚙️ Filter aktiv: Pfad={path_filter_active}, Name={name_filter_active}, Größe={size_filter_active}, Datum={date_filter_active}")
         # Angepasste SQL für optimierte Datenbankstruktur
         sql_select = """
             SELECT files.id, drives.name, directories.full_path,
@@ -189,14 +204,27 @@ class SearchWorker(QThread):
         sql_where = ""
         if where_clauses:
             sql_where = " WHERE " + " AND ".join(where_clauses)
+        
+        # DEBUG: SQL und Parameter loggen
+        self.debug_log.emit(f"\n📊 SQL WHERE-KLAUSELN ({len(where_clauses)}):")
+        for i, clause in enumerate(where_clauses):
+            self.debug_log.emit(f"   [{i}] {clause}")
+        self.debug_log.emit(f"\n📊 PARAMETER ({len(params)}):")
+        for i, p in enumerate(params):
+            self.debug_log.emit(f"   [{i}] {repr(p)}")
+        
         sql_count_query = sql_count + sql_from_joins + sql_where
+        self.debug_log.emit(f"\n🔢 COUNT-QUERY:\n{sql_count_query}")
+        
         result_count = -1
         warnung_gesetzt = False
         try:
             cursor = conn.cursor()
             cursor.execute(sql_count_query, tuple(params))
             result_count = cursor.fetchone()[0]
-        except Exception:
+            self.debug_log.emit(f"\n✅ DB-Ergebnis: {result_count} Treffer")
+        except Exception as e:
+            self.debug_log.emit(f"\n❌ COUNT-QUERY FEHLER: {e}")
             conn.close()
             self.finished.emit([], 0, False)
             return
@@ -205,20 +233,33 @@ class SearchWorker(QThread):
         db_results = []
         if result_count >= 0:
             sql_main_query = sql_select + sql_from_joins + sql_where
+            self.debug_log.emit(f"\n📊 HAUPT-QUERY:\n{sql_main_query}")
             try:
                 cursor = conn.cursor()
                 cursor.execute(sql_main_query, tuple(params))
                 db_results = cursor.fetchall()
-            except Exception:
+                self.debug_log.emit(f"✅ {len(db_results)} Zeilen geladen")
+                # DEBUG: Erste 5 Ergebnisse zeigen
+                for i, row in enumerate(db_results[:5]):
+                    self.debug_log.emit(f"   Zeile {i}: ID={row[0]}, Pfad={row[2]}, Datei={row[3]}")
+                if len(db_results) > 5:
+                    self.debug_log.emit(f"   ... und {len(db_results)-5} weitere")
+            except Exception as e:
+                self.debug_log.emit(f"\n❌ HAUPT-QUERY FEHLER: {e}")
                 conn.close()
                 self.finished.emit([], 0, warnung_gesetzt)
                 return
         filtered_results = []
         if date_filter_active and db_results:
+            self.debug_log.emit(f"\n📅 DATUMS-FILTER aktiv ({date_op}), prüfe {len(db_results)} Dateien auf Dateisystem...")
             filter_dt1 = datetime.date(qdate_val1.year(), qdate_val1.month(), qdate_val1.day())
             filter_dt2 = datetime.date(qdate_val2.year(), qdate_val2.month(), qdate_val2.day())
             if date_op == "Zwischen" and filter_dt2 < filter_dt1:
                 filter_dt1, filter_dt2 = filter_dt2, filter_dt1
+            self.debug_log.emit(f"   Datum-Bereich: {filter_dt1} bis {filter_dt2}")
+            skipped_not_found = 0
+            skipped_no_match = 0
+            skipped_error = 0
             for idx, row_data in enumerate(db_results):
                 drive_part = str(row_data[1])
                 dir_part = str(row_data[2])
@@ -235,12 +276,30 @@ class SearchWorker(QThread):
                     elif date_op == "Zwischen" and filter_dt1 <= mtime_date <= filter_dt2: match = True
                     if match:
                         filtered_results.append(row_data)
+                    else:
+                        skipped_no_match += 1
                 except FileNotFoundError:
+                    skipped_not_found += 1
+                    if skipped_not_found <= 3:
+                        self.debug_log.emit(f"   ⚠️ Datei nicht gefunden: {full_path}")
                     continue
-                except Exception:
+                except Exception as e:
+                    skipped_error += 1
+                    if skipped_error <= 3:
+                        self.debug_log.emit(f"   ❌ Fehler bei: {full_path} → {e}")
                     continue
+            self.debug_log.emit(f"\n   📅 Datums-Filter Ergebnis:")
+            self.debug_log.emit(f"   ✅ Treffer: {len(filtered_results)}")
+            self.debug_log.emit(f"   ⏭️ Datum passt nicht: {skipped_no_match}")
+            self.debug_log.emit(f"   ⚠️ Datei nicht gefunden: {skipped_not_found}")
+            self.debug_log.emit(f"   ❌ Fehler: {skipped_error}")
         else:
             filtered_results = db_results
+            if not date_filter_active:
+                self.debug_log.emit(f"\n📅 Datums-Filter: NICHT aktiv → alle {len(db_results)} DB-Ergebnisse übernommen")
+        
+        self.debug_log.emit(f"\n🏁 ENDERGEBNIS: {len(filtered_results)} Dateien an GUI übergeben")
+        self.debug_log.emit("=" * 60)
         conn.close()
         self.finished.emit(filtered_results, result_count, warnung_gesetzt)
 
@@ -525,6 +584,29 @@ class MainWindow(QtWidgets.QMainWindow):
             button_layout.addWidget(btn)
         button_layout.addStretch()
         
+        # --- DEBUG-Panel ---
+        self.debug_group = QtWidgets.QGroupBox("🐛 Debug-Log (SQL-Queries & Filter)")
+        self.debug_group.setCheckable(True)
+        self.debug_group.setChecked(False)  # Standardmäßig zugeklappt
+        debug_layout = QtWidgets.QVBoxLayout()
+        self.debug_text = QtWidgets.QPlainTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setMaximumHeight(250)
+        self.debug_text.setFont(QtGui.QFont("Consolas", 9))
+        self.debug_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc; border: 1px solid #555;")
+        debug_btn_layout = QtWidgets.QHBoxLayout()
+        debug_clear_btn = QtWidgets.QPushButton("🗑️ Log leeren")
+        debug_clear_btn.clicked.connect(self.debug_text.clear)
+        debug_copy_btn = QtWidgets.QPushButton("📋 Log kopieren")
+        debug_copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.debug_text.toPlainText()))
+        debug_btn_layout.addWidget(debug_clear_btn)
+        debug_btn_layout.addWidget(debug_copy_btn)
+        debug_btn_layout.addStretch()
+        debug_layout.addWidget(self.debug_text)
+        debug_layout.addLayout(debug_btn_layout)
+        self.debug_group.setLayout(debug_layout)
+        # --- Ende DEBUG-Panel ---
+        
         # Zusammenführung der Layouts
         main_layout.addLayout(top_filter_layout)
         main_layout.addLayout(name_filter_layout)
@@ -532,6 +614,7 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(search_button_layout) # NEUES Layout für Button eingefügt
         main_layout.addWidget(self.table)
         main_layout.addLayout(button_layout)
+        main_layout.addWidget(self.debug_group)  # Debug-Panel unten
         central_widget.setLayout(main_layout)
         
         # --- NEU: Statusleiste hinzufügen --- 
@@ -604,7 +687,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Worker starten
         self.worker = SearchWorker(self.db_path, filter_args)
         self.worker.finished.connect(self.on_search_finished)
+        self.worker.debug_log.connect(self._append_debug)
         self.worker.start()
+    
+    def _append_debug(self, msg):
+        """Debug-Nachricht ans Log anhängen"""
+        self.debug_text.appendPlainText(msg)
 
     def on_search_finished(self, filtered_results, result_count, warnung_gesetzt):
         # Tabelle befüllen (wie bisher, aber ohne Suchlogik)

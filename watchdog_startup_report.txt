@@ -1,0 +1,30 @@
+=== Watchdog Startup Report ===
+Zeitpunkt: 2026-02-23 07:45:41
+PID: 41612
+User: COOLERMASTER2$
+
+Geplante Pfade: ['C:\\', 'D:\\', 'E:\\', 'K:\\', 'M:\\', 'O:\\', 'R:\\', 'X:\\', 'Y:\\']
+
+Erfolgreich geschedult (9):
+  OK: O:\
+  OK: R:\
+  OK: D:\
+  OK: M:\
+  OK: E:\
+  OK: K:\
+  OK: Y:\
+  OK: C:\
+  OK: X:\
+
+=== Ende Report ===
+
+=== Health Check (07:45:53) ===
+  O:\ -> OK
+  R:\ -> OK
+  D:\ -> OK
+  M:\ -> OK
+  E:\ -> OK
+  K:\ -> OK
+  Y:\ -> OK
+  C:\ -> OK
+  X:\ -> OK

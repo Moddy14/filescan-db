@@ -1,0 +1,6 @@
+watchdog
+PyQt5
+pystray
+Pillow
+psutil # Wird von auto_update_all.py benötigt
+pyinstaller # Wird von build_portable.py benötigt 

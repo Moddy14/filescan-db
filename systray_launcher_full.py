@@ -204,6 +204,28 @@ def on_scan_all(icon, item):
     if run_script("scan_all_drives.py"):
         icon.notify("Scan aller Laufwerke gestartet", "Scanner")
 
+def on_vollscan(icon, item):
+    """Vollscan: Watchdog stoppen → alle Laufwerke scannen → Watchdog starten.
+    Startet ein Admin-Skript via UAC (ShellExecute runas).
+    """
+    import ctypes
+    bat = r"C:\Temp\scanner_drive_scan.bat"
+    try:
+        # ShellExecute mit 'runas' triggert UAC-Abfrage und läuft als Admin
+        # Kein Parameter = alle Laufwerke scannen
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "cmd.exe", f'/c "{bat}"', None, 1
+        )
+        if ret > 32:
+            icon.notify("Vollscan gestartet (UAC bestätigen)", "Scanner")
+            logger.info("[Vollscan] Admin-Prozess gestartet.")
+        else:
+            icon.notify("Vollscan: Fehler beim Starten (UAC abgelehnt?)", "Fehler")
+            logger.error(f"[Vollscan] ShellExecute fehlgeschlagen, ret={ret}")
+    except Exception as e:
+        icon.notify(f"Vollscan Fehler: {e}", "Fehler")
+        logger.error(f"[Vollscan] Ausnahme: {e}")
+
 def on_scan_current(icon, item):
     """Scannt das konfigurierte Laufwerk."""
     logger.info("Starte Scan des konfigurierten Pfads...")
@@ -382,7 +404,9 @@ def main():
     
     # Scan-Menü
     scan_menu = pystray.Menu(
-        item('🔄 Alle Laufwerke scannen', on_scan_all),
+        item('🔄 Vollscan (Watchdog stoppen + alle Laufwerke)', on_vollscan),
+        pystray.Menu.SEPARATOR,
+        item('▶ Alle Laufwerke scannen', on_scan_all),
         item('📁 Aktuellen Pfad scannen', on_scan_current),
     )
     menu_items.append(item('💾 Scan', scan_menu))
@@ -425,6 +449,20 @@ def main():
         title="Datei Scanner System\n(Doppelklick für GUI)",
         menu=menu
     )
+    
+    # Watchdog automatisch starten (als User-Prozess statt Service)
+    try:
+        if find_watchdog_pid() is None:
+            logger.info("[Tray] Starte Watchdog automatisch als User-Prozess...")
+            if start_watchdog():
+                logger.info("[Tray] Watchdog erfolgreich gestartet")
+                icon.notify("Watchdog gestartet", "DateiScanner")
+            else:
+                logger.warning("[Tray] Watchdog konnte nicht gestartet werden")
+        else:
+            logger.info("[Tray] Watchdog läuft bereits")
+    except Exception as e:
+        logger.warning(f"[Tray] Fehler beim Auto-Start des Watchdog: {e}")
     
     # Icon starten
     logger.info("System-Tray bereit")

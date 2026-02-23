@@ -678,6 +678,9 @@ class DBManager:
         logger.info("[DB Commit] Committing final changes on DB close.")
         self.conn.commit()
         self.conn.close()
+        # Singleton zurücksetzen, damit get_db_instance() eine neue Verbindung erstellt
+        global _db_instance
+        _db_instance = None
 
     @with_lock
     def acquire_scan_lock(self, scan_type="manual"):
@@ -767,9 +770,17 @@ class DBManager:
         Returns:
             bool: True wenn ein Scan aktiv ist, False sonst
         """
-        self.cursor.execute("SELECT COUNT(*) FROM scan_lock WHERE is_active=1")
-        count = self.cursor.fetchone()[0]
-        return count > 0
+        try:
+            self.cursor.execute("SELECT COUNT(*) FROM scan_lock WHERE is_active=1")
+            row = self.cursor.fetchone()
+            if row is None:
+                return False
+            count = row[0]
+            if count is None:
+                return False
+            return count > 0
+        except Exception:
+            return False
 
 def get_db_instance(path=None):
     """Gibt eine globale, thread-sichere Singleton-Instanz des DBManagers zurück."""
@@ -777,6 +788,14 @@ def get_db_instance(path=None):
     with _db_lock: # Schützt den Zugriff auf globale Variablen
         # Bestimme den zu verwendenden Pfad: Übergebener Pfad hat Vorrang, sonst Standard aus utils
         db_path_to_use = path or DB_PATH
+
+        # Sicherheitscheck: Instanz vorhanden aber Verbindung bereits geschlossen?
+        if _db_instance is not None:
+            try:
+                _db_instance.conn.execute("SELECT 1")
+            except Exception:
+                logger.warning("[DB] Bestehende Instanz hat geschlossene Verbindung – wird neu erstellt.")
+                _db_instance = None
 
         if _db_instance is None:
             # Erster Aufruf oder nach Schließen/Änderung

@@ -111,6 +111,18 @@ def _create_fallback_logger():
         fallback_logger.setLevel(logging.WARNING) # Mindestens Warnungen anzeigen
     return fallback_logger
 
+class _WinSafeRotatingHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler der auf Windows PermissionError bei der Log-Rotation ignoriert.
+    Wenn eine andere Prozess die Log-Datei offen hält, wird die Rotation übersprungen
+    und in die aktuelle Datei weitergeschrieben statt abzustürzen.
+    """
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except PermissionError:
+            pass  # Andere Prozess hat die Datei offen — Rotation überspringen
+
+
 def setup_logging(log_filename="scanner.log", level_str="INFO", logger_name=None):
     try:
         # Konvertiere Level-String zu logging Level
@@ -135,10 +147,10 @@ def setup_logging(log_filename="scanner.log", level_str="INFO", logger_name=None
         max_bytes = 10 * 1024 * 1024 # 10 MB
         backup_count = 5
         # Versuche den Handler zu erstellen und hinzuzufügen
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file_path, 
-            maxBytes=max_bytes, 
-            backupCount=backup_count, 
+        file_handler = _WinSafeRotatingHandler(
+            log_file_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
             encoding='utf-8'
         )
         file_handler.setFormatter(log_formatter)

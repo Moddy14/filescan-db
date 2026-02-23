@@ -10,6 +10,13 @@ import logging # Hinzufügen
 from utils import calculate_hash, HASHING, CONFIG, DB_PATH, load_config, logger # logger importieren
 from models import get_db_instance
 
+# ScanLock optional import (prozessübergreifende Pause für Watchdog während Core-Scan)
+try:
+    from scan_lock import write_scan_lockfile, remove_scan_lockfile
+    _scan_lock_available = True
+except Exception:
+    _scan_lock_available = False
+
 # --- Entferne alte, lokale Funktionen --- 
 # def load_config():
 #     ...
@@ -541,8 +548,15 @@ def main():
         logger.error(f"[Core Scan] Konnte keinen Scan-Lock erwerben. Möglicherweise läuft ein anderer Scan. Verwende --force, um den Scan trotzdem zu starten.")
         sys.exit(3)
     
-    # Scan-Ausführung in try-finally Block, damit der Lock auf jeden Fall freigegeben wird
+    # Scan-Ausführung in try-finally Block, damit Locks auf jeden Fall freigegeben werden
     try:
+        # Prozessübergreifende Scan-Lockdatei setzen, damit Watchdog-FSHandler pausiert
+        if _scan_lock_available:
+            try:
+                write_scan_lockfile(f"scanner_core:{scan_path}")
+            except Exception as e:
+                logger.warning(f"[Core Scan] Konnte Scan-Lockdatei nicht setzen: {e}")
+
         # Starte den Scan mit dem force_restart Flag aus den Argumenten
         success = run_scan(scan_path, force_restart=args.restart)
 
@@ -553,7 +567,14 @@ def main():
             logger.error("[Core Scan] Programm mit Fehlern beendet.") # Geändert auf logger.error
             exit_code = 1
     finally:
-        # Lock freigeben, auch wenn ein Fehler auftrat
+        # Lockdatei entfernen (wenn gesetzt), auch bei Fehlern
+        if _scan_lock_available:
+            try:
+                remove_scan_lockfile()
+            except Exception as e:
+                logger.warning(f"[Core Scan] Konnte Scan-Lockdatei nicht entfernen: {e}")
+
+        # DB-Scan-Lock freigeben, auch wenn ein Fehler auftrat
         if lock_id:
             db.release_scan_lock(lock_id)
             logger.info(f"[Core Scan] Scan-Lock {lock_id} freigegeben.")

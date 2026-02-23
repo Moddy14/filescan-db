@@ -1155,25 +1155,31 @@ class MainWindow(QMainWindow):
             watchdog_pid = find_watchdog_pid()
             
             if watchdog_pid:
-                reply = QMessageBox.question(self, "Watchdog-Service läuft",
-                                           f"Der Watchdog-Service läuft (PID: {watchdog_pid}).\n\n"
-                                           "Soll der Watchdog automatisch pausiert werden?\n"
-                                           "(Empfohlen um 'database is locked' Fehler zu vermeiden)",
-                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-                
-                if reply == QMessageBox.Yes:
-                    self.log_display.append("[INFO] Pausiere Watchdog-Service...")
-                    if stop_watchdog():
-                        self.log_display.append("[OK] Watchdog-Service pausiert")
-                        self.watchdog_was_paused = True
-                    else:
-                        self.log_display.append("[WARNUNG] Konnte Watchdog nicht pausieren")
-                        QMessageBox.warning(self, "Warnung", 
-                                          "Watchdog konnte nicht pausiert werden.\n"
-                                          "Scan kann zu 'database is locked' Fehlern führen.")
+                # Watchdog läuft → immer stoppen (keine Rückfrage, es ist immer nötig)
+                self.log_display.append("[INFO] Stoppe Watchdog-Service vor Scan...")
+                if stop_watchdog():
+                    self.log_display.append("[OK] Watchdog-Service gestoppt")
+                    self.watchdog_was_paused = True
                 else:
-                    logger.warning("[GUI] Scan wird mit laufendem Watchdog gestartet")
-                    self.watchdog_was_paused = False
+                    # stop_watchdog() fehlgeschlagen → braucht Admin-Rechte → via UAC
+                    self.log_display.append("[INFO] Watchdog braucht Admin-Rechte – starte UAC...")
+                    import ctypes
+                    bat = r"C:\Temp\scanner_drive_scan.bat"
+                    # Gewähltes Laufwerk als Parameter übergeben (leer = alle Laufwerke)
+                    drive_arg = f'"{selected_path}"' if selected_path else ""
+                    cmd_args = f'/c "{bat}" {drive_arg}'
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "runas", "cmd.exe", cmd_args, None, 1
+                    )
+                    if ret > 32:
+                        self.log_display.append(
+                            f"[INFO] Scan für {selected_path or 'alle Laufwerke'} als Admin gestartet (UAC).\n"
+                            "[INFO] Der Watchdog wird nach dem Scan automatisch neu gestartet."
+                        )
+                    else:
+                        self.log_display.append("[FEHLER] UAC abgelehnt oder Fehler beim Starten.")
+                    # Admin-Skript übernimmt alles – GUI-Scan nicht starten
+                    return
             else:
                 self.watchdog_was_paused = False
                 
@@ -1456,8 +1462,108 @@ class MainWindow(QMainWindow):
                     f"  Fehlende Dateien: {result.get('missing_files', 0):,}\n"
                     f"  Aktualisierte Dateien: {result.get('updated_files', 0):,}"
                 )
+
+                # Fehlende Pfade nach Laufwerk anzeigen
+                dirs_by_drive = result.get('missing_dirs_by_drive', {})
+                files_by_drive = result.get('missing_files_by_drive', {})
+                missing_dir_paths = result.get('missing_dir_paths', [])
+                missing_file_paths = result.get('missing_file_paths', [])
+
+                if dirs_by_drive or files_by_drive:
+                    summary += "\n\n── Fehlend nach Laufwerk ──"
+                    for drive in sorted(set(list(dirs_by_drive.keys()) + list(files_by_drive.keys()))):
+                        d_count = dirs_by_drive.get(drive, 0)
+                        f_count = files_by_drive.get(drive, 0)
+                        parts = []
+                        if d_count:
+                            parts.append(f"{d_count} Verz.")
+                        if f_count:
+                            parts.append(f"{f_count} Dateien")
+                        summary += f"\n  {drive}\\  →  {', '.join(parts)}"
+
+                # Detail-Pfade im Log-Fenster anzeigen (nicht im Popup)
+                if missing_dir_paths or missing_file_paths:
+                    self.log_display.append("\n══════ FEHLENDE PFADE (aus DB entfernt) ══════")
+                    if missing_dir_paths:
+                        self.log_display.append(f"\n🔴 Fehlende Verzeichnisse ({len(missing_dir_paths)}):")
+                        for p in missing_dir_paths:
+                            self.log_display.append(f"   ✗ {p}")
+                    if missing_file_paths:
+                        self.log_display.append(f"\n🔴 Fehlende Dateien ({len(missing_file_paths)}):")
+                        for p in missing_file_paths:
+                            self.log_display.append(f"   ✗ {p}")
+                    self.log_display.append("══════════════════════════════════════════════\n")
+
                 self.log_display.append(f"\n--- {summary.replace(chr(10), chr(10) + '    ')} ---")
+
+                # Report-Datei schreiben wenn Fehler gefunden
+                report_path = None
+                if missing_dir_paths or missing_file_paths:
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+                    os.makedirs(logs_dir, exist_ok=True)
+                    report_path = os.path.join(logs_dir, f"integrity_report_{timestamp}.txt")
+                    try:
+                        with open(report_path, 'w', encoding='utf-8') as f:
+                            f.write(f"Integritätsprüfung — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            f.write(f"{'=' * 60}\n\n")
+                            f.write(f"Geprüft: {result.get('checked_dirs', 0):,} Verzeichnisse, {result.get('checked_files', 0):,} Dateien\n")
+                            f.write(f"Dauer: {result.get('duration', '?')} Sek.\n\n")
+
+                            if dirs_by_drive or files_by_drive:
+                                f.write(f"Zusammenfassung nach Laufwerk:\n")
+                                f.write(f"{'-' * 40}\n")
+                                for drive in sorted(set(list(dirs_by_drive.keys()) + list(files_by_drive.keys()))):
+                                    d_count = dirs_by_drive.get(drive, 0)
+                                    f_count = files_by_drive.get(drive, 0)
+                                    parts = []
+                                    if d_count:
+                                        parts.append(f"{d_count} Verz.")
+                                    if f_count:
+                                        parts.append(f"{f_count} Dateien")
+                                    f.write(f"  {drive}\\  →  {', '.join(parts)}\n")
+                                f.write(f"\n")
+
+                            if missing_dir_paths:
+                                f.write(f"Fehlende Verzeichnisse ({len(missing_dir_paths)}):\n")
+                                f.write(f"{'-' * 40}\n")
+                                for p in sorted(missing_dir_paths):
+                                    f.write(f"  ✗ {p}\n")
+                                f.write(f"\n")
+
+                            if missing_file_paths:
+                                f.write(f"Fehlende Dateien ({len(missing_file_paths)}):\n")
+                                f.write(f"{'-' * 40}\n")
+                                for p in sorted(missing_file_paths):
+                                    f.write(f"  ✗ {p}\n")
+                                f.write(f"\n")
+
+                            f.write(f"{'=' * 60}\n")
+                            f.write(f"Alle Einträge wurden aus der DB entfernt.\n")
+                        self.log_display.append(f"[INFO] Report gespeichert: {report_path}")
+                    except Exception as e:
+                        logger.error(f"[GUI] Report schreiben fehlgeschlagen: {e}")
+                        report_path = None
+
                 QMessageBox.information(self, "Integritätsprüfung abgeschlossen", summary)
+
+                # Nach dem Popup: Report in Notepad++ öffnen anbieten
+                if report_path and os.path.isfile(report_path):
+                    reply = QMessageBox.question(
+                        self, "Report öffnen",
+                        f"{result.get('missing_dirs', 0) + result.get('missing_files', 0)} fehlende Einträge gefunden.\n\n"
+                        f"Report in Notepad++ öffnen?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Yes:
+                        npp_path = r"T:\Programme\Utilities\Editoren\Notepad++Portable\Notepad++Portable.exe"
+                        if os.path.isfile(npp_path):
+                            import subprocess
+                            subprocess.Popen([npp_path, report_path])
+                        else:
+                            # Fallback: Windows-Standardeditor
+                            os.startfile(report_path)
             else:
                 self.log_display.append("\n--- Integritätsprüfung abgeschlossen ---")
                 QMessageBox.information(self, "Abgeschlossen", "Integritätsprüfung erfolgreich abgeschlossen.")

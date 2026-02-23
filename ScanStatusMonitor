@@ -1,0 +1,3 @@
+2025-10-15 08:19:04,110 - INFO - [utils.py:153] - Logging für 'root' erfolgreich konfiguriert (Level: INFO, Datei: T:\Programme\Entwicklung\Python\Projekte\DateiDB\scanner_portable\ScanStatusMonitor)
+2026-02-21 09:03:11,472 - INFO - [utils.py:165] - Logging für 'root' erfolgreich konfiguriert (Level: INFO, Datei: C:\Laufwerk T\USB16GB\Programme\Entwicklung\Python\Projekte\DateiDB\scanner_portable\ScanStatusMonitor)
+2026-02-21 09:03:11,579 - INFO - [scan_status_monitor.py:180] - Bereinigt: Verwaister Lock 95 (PID 21640 existiert nicht mehr)
