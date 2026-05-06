@@ -702,7 +702,10 @@ class DBManager:
             import socket, os
             current_hostname = socket.gethostname()
             
-            if lock_hostname == current_hostname:
+            # Hostname-Vergleich robust (Groß/Kleinschreibung)
+            same_host = str(lock_hostname or "").strip().lower() == str(current_hostname or "").strip().lower()
+
+            if same_host:
                 import psutil
                 try:
                     # Wenn PID nicht mehr existiert, ist der Scan vermutlich abgestürzt
@@ -713,6 +716,18 @@ class DBManager:
                 except:
                     # Falls psutil nicht installiert/verfügbar
                     logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+            else:
+                # Fallback: sehr alte aktive Locks als verwaist behandeln (z.B. Hostname-Formatwechsel)
+                try:
+                    import datetime as _dt
+                    lock_dt = _dt.datetime.fromisoformat(str(lock_time))
+                    age = (_dt.datetime.now() - lock_dt).total_seconds()
+                    if age > 6 * 3600:
+                        logger.warning(f"[DB] Sehr alter aktiver Scan-Lock gefunden ({age/3600:.1f}h, Host {lock_hostname}). Setze Lock zurück.")
+                        self.release_scan_lock(lock_id)
+                        active_scan = None
+                except Exception:
+                    pass
             
             # Wenn immer noch ein aktiver Scan läuft, kein Lock erwerben
             if active_scan:
