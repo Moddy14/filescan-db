@@ -713,6 +713,21 @@ class DBManager:
                         logger.warning(f"[DB] Verwaister Scan-Lock gefunden (PID {lock_pid} existiert nicht mehr). Setze Lock zurück.")
                         self.release_scan_lock(lock_id)
                         active_scan = None
+                    else:
+                        # PID-Reuse absichern: nur echte Scan-Prozesse akzeptieren
+                        p = psutil.Process(lock_pid)
+                        cmdline = " ".join(p.cmdline()).lower()
+                        scan_markers = [
+                            "scanner_core.py",
+                            "scan_all_drives.py",
+                            "integrity_checker.py",
+                            "scheduled_scanner.py",
+                            "watchdog_service.py",
+                        ]
+                        if not any(m in cmdline for m in scan_markers):
+                            logger.warning(f"[DB] Verwaister Scan-Lock gefunden (PID {lock_pid} gehört nicht zu Scan-Prozess). Setze Lock zurück.")
+                            self.release_scan_lock(lock_id)
+                            active_scan = None
                 except:
                     # Falls psutil nicht installiert/verfügbar
                     logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
