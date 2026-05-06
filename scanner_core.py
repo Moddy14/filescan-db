@@ -536,17 +536,14 @@ def main():
     # Prüfe, ob bereits ein Scan läuft und erwerbe einen Lock
     scan_type = "scheduled" if args.scheduled else "manual"
     
-    # Wenn --force angegeben wurde, prüfen wir nicht auf laufende Scans
-    if not args.force:
-        if db.is_scan_running():
-            logger.error(f"[Core Scan] Ein anderer Scan läuft bereits. Dieser Scan wird abgebrochen. Verwende --force, um den Scan trotzdem zu starten.")
-            sys.exit(2)
-    
-    # Erwerbe Lock (auch wenn --force verwendet wird, damit andere Scans den aktiven Scan sehen)
+    # Erwerbe Lock direkt über DBManager (inkl. Stale-Lock-Heilung)
     lock_id = db.acquire_scan_lock(scan_type=scan_type)
-    if not lock_id and not args.force:
-        logger.error(f"[Core Scan] Konnte keinen Scan-Lock erwerben. Möglicherweise läuft ein anderer Scan. Verwende --force, um den Scan trotzdem zu starten.")
-        sys.exit(3)
+    if not lock_id:
+        if not args.force:
+            logger.error(f"[Core Scan] Konnte keinen Scan-Lock erwerben. Möglicherweise läuft ein anderer Scan. Verwende --force, um den Scan trotzdem zu starten.")
+            sys.exit(3)
+        else:
+            logger.warning("[Core Scan] --force aktiv: starte trotz fehlendem DB-Scan-Lock.")
     
     # Scan-Ausführung in try-finally Block, damit Locks auf jeden Fall freigegeben werden
     try:
