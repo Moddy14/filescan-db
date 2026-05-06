@@ -899,18 +899,26 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
 
         for term in terms:
             if term['is_first']:
-                sql_parts.append(f"({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                sql_parts.append(
+                    f"({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                )
+                params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
             else:
                 if term['operator'] == 'NOT':
-                    sql_parts.append(f"AND ({full_name_expr} NOT LIKE ? AND files.filename NOT LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"AND ({full_name_expr} NOT LIKE ? AND files.filename NOT LIKE ? AND COALESCE(extensions.name, '') NOT LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 elif term['operator'] == 'OR':
-                    sql_parts.append(f"OR ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"OR ({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 else:  # AND
-                    sql_parts.append(f"AND ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"AND ({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
         
         if sql_parts:
             # Gesamten Ausdruck in Klammern setzen
