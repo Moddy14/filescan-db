@@ -729,8 +729,19 @@ class DBManager:
                             self.release_scan_lock(lock_id)
                             active_scan = None
                 except:
-                    # Falls psutil nicht installiert/verfügbar
-                    logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+                    # Falls PID nicht prüfbar: alte Locks trotzdem heilen
+                    try:
+                        import datetime as _dt
+                        lock_dt = _dt.datetime.fromisoformat(str(lock_time))
+                        age = (_dt.datetime.now() - lock_dt).total_seconds()
+                        if age > 6 * 3600:
+                            logger.warning(f"[DB] PID {lock_pid} nicht prüfbar, aber Lock ist alt ({age/3600:.1f}h). Setze Lock zurück.")
+                            self.release_scan_lock(lock_id)
+                            active_scan = None
+                        else:
+                            logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+                    except Exception:
+                        logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
             else:
                 # Fallback: sehr alte aktive Locks als verwaist behandeln (z.B. Hostname-Formatwechsel)
                 try:
