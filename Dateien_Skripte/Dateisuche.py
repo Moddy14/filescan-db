@@ -167,16 +167,16 @@ class SearchWorker(QThread):
                 sql_part += " OR "
             elif op_before_term == "NICHT":
                 # Angepasst für neue Datenbankstruktur - Suche in filename UND extension
-                sql_part += " AND (files.filename NOT LIKE ? AND COALESCE(extensions.name, '') NOT LIKE ?) "
-                params.extend([name_like, name_like])
+                sql_part += " AND (files.filename NOT LIKE ? AND COALESCE(extensions.name, '') NOT LIKE ? AND (files.filename || COALESCE(extensions.name, '')) NOT LIKE ?) "
+                params.extend([name_like, name_like, name_like])
                 name_filter_sql_parts.append(sql_part)
                 continue
             else:
                 if idx > 0:
                     sql_part += " AND "
             # Angepasst für neue Datenbankstruktur - Suche in filename UND extension  
-            sql_part += " (files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?) "
-            params.extend([name_like, name_like])
+            sql_part += " (files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ? OR (files.filename || COALESCE(extensions.name, '')) LIKE ?) "
+            params.extend([name_like, name_like, name_like])
             if op_before_term != "NICHT":
                 name_filter_sql_parts.append(sql_part)
         if name_filter_sql_parts:
