@@ -338,7 +338,9 @@ class FSHandler(FileSystemEventHandler):
                     self.db.cursor.execute("SELECT id FROM directories WHERE drive_id = ? AND full_path = ?", (self.drive_id, src_dir.replace("\\", "/")))
                     src_dir_row = self.db.cursor.fetchone()
                     if not src_dir_row:
-                        logger.warning(f"[Watchdog Move] Quell-Verzeichnis nicht gefunden: {src_dir}")
+                        logger.warning(f"[Watchdog Move] Quell-Verzeichnis nicht gefunden: {src_dir} -> fallback insert für Ziel")
+                        # Fallback: Zielzustand trotzdem indexieren (wichtig bei unvollständiger DB)
+                        self._insert_or_update_file(dest_path)
                         return
                     src_dir_id = src_dir_row[0]
 
@@ -352,7 +354,9 @@ class FSHandler(FileSystemEventHandler):
                     )
                     file_row = self.db.cursor.fetchone()
                     if not file_row:
-                        logger.warning(f"[Watchdog Move] Datei nicht in DB gefunden: {src_path}")
+                        logger.warning(f"[Watchdog Move] Datei nicht in DB gefunden: {src_path} -> fallback insert für Ziel")
+                        # Fallback: Rename/Move soll trotzdem in DB landen
+                        self._insert_or_update_file(dest_path)
                         return
                     file_id = file_row[0]
 
