@@ -52,3 +52,45 @@ class TestCleanupScanLockHistory:
         db.cleanup_scan_lock_history(keep_recent=0)  # aggressivste Bereinigung
         db.cursor.execute("SELECT COUNT(*) FROM scan_lock WHERE is_active = 1")
         assert db.cursor.fetchone()[0] == 1
+
+
+class TestCleanupOrphanExtensions:
+
+    def test_removes_orphan_junk_keeps_used_and_standard(self, in_memory_db):
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        d = db.get_or_create_directory(drive, "C:/D")
+        db.batch_insert_files([(d, "a.py", 1, None)])  # .py wird genutzt
+        db.conn.commit()
+
+        # verwaiste, automatisch angelegte Extension (KEIN mime_type)
+        db.cursor.execute(
+            "INSERT INTO extensions (name, category, is_binary) VALUES ('.junk123', 'other', 0)"
+        )
+        db.conn.commit()
+
+        removed = db.cleanup_orphan_extensions()
+        assert removed >= 1
+
+        def count(name):
+            db.cursor.execute("SELECT COUNT(*) FROM extensions WHERE name = ?", (name,))
+            return db.cursor.fetchone()[0]
+
+        assert count(".junk123") == 0, "verwaiste Müll-Extension muss entfernt werden"
+        assert count(".py") == 1, "genutzte Extension muss bleiben"
+        assert count(".pdf") == 1, "Standard-Extension (mit mime_type) muss bleiben (auch ungenutzt)"
+
+    def test_does_not_break_fk(self, in_memory_db):
+        """Nach der Bereinigung dürfen keine files auf gelöschte Extensions zeigen."""
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        d = db.get_or_create_directory(drive, "C:/D")
+        db.batch_insert_files([(d, "x.zip", 1, None), (d, "y.weirdext999", 2, None)])
+        db.conn.commit()
+        db.cleanup_orphan_extensions()
+        # Jede Datei muss weiterhin eine gültige extension_id haben
+        db.cursor.execute(
+            "SELECT COUNT(*) FROM files f LEFT JOIN extensions e ON f.extension_id = e.id "
+            "WHERE f.extension_id IS NOT NULL AND e.id IS NULL"
+        )
+        assert db.cursor.fetchone()[0] == 0, "keine verwaisten extension_id-Verweise"

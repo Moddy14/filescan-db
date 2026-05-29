@@ -862,6 +862,30 @@ class DBManager:
         self.conn.commit()
         return removed
 
+    @with_lock
+    def cleanup_orphan_extensions(self):
+        """Entfernt verwaiste, NICHT-standardisierte Extension-Einträge.
+
+        Löscht Extensions, die von KEINER Datei genutzt werden UND keinen
+        mime_type haben (= automatisch angelegte „Müll"-Extensions, die nach
+        dem Löschen ihrer Dateien zurückbleiben, da es kein CASCADE auf
+        extensions gibt). Standard-Extensions (mit mime_type) und aktuell
+        genutzte bleiben unangetastet. Gibt die Anzahl gelöschter Einträge zurück.
+        """
+        self.cursor.execute(
+            """
+            DELETE FROM extensions
+            WHERE mime_type IS NULL
+              AND id NOT IN (
+                  SELECT DISTINCT extension_id FROM files
+                  WHERE extension_id IS NOT NULL
+              )
+            """
+        )
+        removed = self.cursor.rowcount
+        self.conn.commit()
+        return removed
+
     def read_query(self, sql, params=()):
         """Führt eine reine Lese-Abfrage aus und gibt fetchall() zurück.
 
