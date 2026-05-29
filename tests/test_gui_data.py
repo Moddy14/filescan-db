@@ -41,6 +41,22 @@ class TestGetDriveOverview:
         ov = gui_data.get_drive_overview(db, "C:/")
         assert ov["resume_point"] == "C:/data/sub"
 
+    def test_clean_orphaned_locks(self, in_memory_db):
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        db.update_scan_progress(drive, "C:/somewhere")
+        lock_id = db.acquire_scan_lock("test")
+        assert db.is_scan_running() is True
+
+        import gui_data
+        deleted, deactivated = gui_data.clean_orphaned_locks(db)
+
+        assert deleted >= 1
+        assert deactivated >= 1
+        assert db.is_scan_running() is False
+        db.cursor.execute("SELECT COUNT(*) FROM scan_progress")
+        assert db.cursor.fetchone()[0] == 0
+
     def test_does_not_use_shared_cursor(self, in_memory_db):
         """Der Daten-Layer darf den geteilten db.cursor nicht 'verbrauchen'
         (eigener Cursor), damit parallele UI-Operationen nicht gestört werden."""

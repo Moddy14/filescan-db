@@ -71,6 +71,27 @@ def get_drive_overview(db, drive_name):
         cursor.close()
 
 
+def clean_orphaned_locks(db):
+    """Setzt alle aktiven Scan-Locks inaktiv und entfernt Scan-Progress-Einträge.
+
+    Verwendet einen eigenen Cursor (berührt den geteilten db.cursor nicht).
+
+    Returns:
+        tuple (deleted_progress, deactivated_locks): Anzahl gelöschter
+        Progress-Einträge und deaktivierter Locks.
+    """
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute("DELETE FROM scan_progress")
+        deleted = cursor.rowcount
+        cursor.execute("UPDATE scan_lock SET is_active = 0 WHERE is_active = 1")
+        deactivated = cursor.rowcount
+        db.conn.commit()
+        return deleted, deactivated
+    finally:
+        cursor.close()
+
+
 def drive_name_from_path(path):
     """Ermittelt aus einem beliebigen Pfad den Laufwerksnamen in DB-Schreibweise.
 

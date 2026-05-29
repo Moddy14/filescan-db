@@ -1291,11 +1291,9 @@ class MainWindow(QMainWindow):
                     self.log_display.append(f"[FEHLER] Bereinigung fehlgeschlagen: {result.stderr}")
                     QMessageBox.warning(self, "Fehler", "Fehler beim Bereinigen der Locks")
             else:
-                # Fallback: Direkte Bereinigung
+                # Fallback: Direkte Bereinigung (ausgelagert nach gui_data, cursor-isoliert)
                 db = get_db_instance()
-                db.cursor.execute("DELETE FROM scan_progress")
-                db.cursor.execute("UPDATE scan_lock SET is_active = 0 WHERE is_active = 1")
-                db.conn.commit()
+                gui_data.clean_orphaned_locks(db)
                 self.log_display.append("[OK] Scan-Locks und Progress bereinigt")
                 QMessageBox.information(self, "Bereinigung erfolgreich", 
                                       "Alle Scan-Locks und Progress-Einträge wurden bereinigt.")
