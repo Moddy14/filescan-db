@@ -404,7 +404,8 @@ class FSHandler(FileSystemEventHandler):
             with _db_lock:
                 try:
                     if event.is_directory:
-                        logger.info(f"[Watchdog Move] Verzeichnis verschoben/umbenannt: {src_path} -> {dest_path}. Manuelle Prüfung/Rescan empfohlen.")
+                        moved = self._handle_directory_move(src_path, dest_path)
+                        logger.info(f"[Watchdog Move] Verzeichnis verschoben/umbenannt: {src_path} -> {dest_path} ({moved} Eintraege aktualisiert)")
                         return
 
                     # Datei umbenannt/verschoben - für neue DB-Struktur
@@ -573,6 +574,67 @@ class FSHandler(FileSystemEventHandler):
             logger.info(f"[Watchdog Create] Verzeichnis hinzugefügt: {dir_path}")
         else:
             logger.error(f"[Watchdog Create-Fehler] Konnte Verzeichnis nicht hinzufügen: {dir_path}")
+
+    def _handle_directory_move(self, src_dir, dest_dir):
+        """Aktualisiert ein verschobenes/umbenanntes Verzeichnis und ALLE
+        Nachkommen in der DB (full_path, directory_name, parent_id, depth_level).
+
+        Die zugehörigen Dateien bleiben automatisch korrekt verknüpft, da sich
+        nur die full_path-Werte der Verzeichnisse ändern, nicht deren IDs.
+
+        Muss unter gehaltenem _db_lock aufgerufen werden (siehe on_moved).
+        Gibt die Anzahl der aktualisierten Verzeichnis-Einträge zurück.
+        """
+        src_fp = os.path.normpath(src_dir).replace("\\", "/")
+        dest_fp = os.path.normpath(dest_dir).replace("\\", "/")
+        if src_fp == dest_fp:
+            return 0
+
+        # Verschobenes Verzeichnis selbst + alle Nachkommen einsammeln
+        self.db.cursor.execute(
+            "SELECT id, full_path FROM directories "
+            "WHERE drive_id = ? AND (full_path = ? OR full_path LIKE ?)",
+            (self.drive_id, src_fp, src_fp + "/%"),
+        )
+        affected = self.db.cursor.fetchall()
+        if not affected:
+            return 0
+
+        drive_root = (self.drive_name or "").rstrip("/")
+
+        def _depth(fp):
+            if drive_root and fp.startswith(drive_root):
+                rel = fp[len(drive_root):].strip("/")
+            else:
+                rel = fp.strip("/")
+            return len([p for p in rel.split("/") if p]) if rel else 0
+
+        # Neuer Parent für das verschobene Top-Verzeichnis
+        dest_parent = os.path.dirname(dest_fp)
+        if dest_parent and dest_parent != drive_root and dest_parent + "/" != self.drive_name:
+            new_parent_id = self.db.get_or_create_directory_optimized(self.drive_id, dest_parent)
+        else:
+            new_parent_id = None
+
+        for dir_id, fp in affected:
+            new_fp = dest_fp + fp[len(src_fp):]
+            new_name = os.path.basename(new_fp)
+            new_depth = _depth(new_fp)
+            if fp == src_fp:
+                self.db.cursor.execute(
+                    "UPDATE directories SET full_path = ?, directory_name = ?, "
+                    "parent_id = ?, depth_level = ? WHERE id = ?",
+                    (new_fp, new_name, new_parent_id, new_depth, dir_id),
+                )
+            else:
+                self.db.cursor.execute(
+                    "UPDATE directories SET full_path = ?, depth_level = ? WHERE id = ?",
+                    (new_fp, new_depth, dir_id),
+                )
+
+        self.db.conn.commit()
+        self._checkpoint_if_due("DirMove")
+        return len(affected)
 
 
     def _insert_or_update_file(self, filepath):
