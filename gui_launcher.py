@@ -37,50 +37,8 @@ def calculate_hash(filepath):
     except Exception:
         return None
 
-class LogUpdater(QtCore.QThread):
-    log_updated = QtCore.pyqtSignal(str)
-
-    def __init__(self, log_file, parent=None):
-        super().__init__(parent)
-        self.log_file = log_file
-        self._running = True
-        self._last_size = 0
-
-    def run(self):
-        while self._running:
-            try:
-                if os.path.exists(self.log_file):
-                    with open(self.log_file, "r", encoding="utf-8") as f:
-                        f.seek(self._last_size)
-                        new_data = f.read()
-                        if new_data:
-                            self.log_updated.emit(new_data)
-                            self._last_size = f.tell()
-            except Exception as e:
-                self.log_updated.emit(f"[Log-Fehler] {e}\n")
-            self.msleep(1000)
-
-    def stop(self):
-        self._running = False
-
-class ScanWorker(QtCore.QThread):
-    """Führt den Scan-Vorgang in einem separaten Thread aus."""
-    scan_progress = QtCore.pyqtSignal(str) # Signal für Fortschrittsmeldungen
-    scan_finished = QtCore.pyqtSignal(bool, str) # Signal für Abschluss (Erfolg, Nachricht)
-
-    def __init__(self, base_path, parent=None):
-        super().__init__(parent)
-        self.base_path = base_path
-        self._running = True
-
-    def run(self):
-        # ... (Rest der run-Methode wie zuvor implementiert)
-        # ... (mit korrekter Einrückung)
-        pass # Platzhalter, falls run leer wäre
-
-    def stop(self):
-        """Signalisiert dem Thread, dass er beendet werden soll."""
-        self._running = False
+# Worker-Threads ausgelagert nach gui_workers.py
+from gui_workers import LogUpdater, ScanWorker
 
 # --- Neue Klasse für den Einstellungsdialog --- 
 class HashingSettingsDialog(QDialog):
