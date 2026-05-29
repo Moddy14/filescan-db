@@ -61,6 +61,38 @@ class TestOnModified:
         assert db.cursor.fetchone()[0] == 0
 
 
+class TestPendingEventQueue:
+    """Events, die waehrend eines Scan-Locks auflaufen, duerfen nicht verloren
+    gehen, sondern werden gepuffert und beim naechsten Schreibfenster abgearbeitet."""
+
+    def test_buffered_during_scanlock_then_drained(self, handler, monkeypatch):
+        db = handler.db
+        state = {"writable": False}
+        monkeypatch.setattr(handler, "_wait_for_write_window", lambda p: state["writable"])
+
+        # Scan laeuft (kein Schreibfenster) -> Event wird gepuffert, nicht verarbeitet
+        handler.on_created(FakeEvent("C:/scanlockdir", True))
+        db.cursor.execute("SELECT COUNT(*) FROM directories WHERE full_path = 'C:/scanlockdir'")
+        assert db.cursor.fetchone()[0] == 0, "darf waehrend Scan-Lock nicht verarbeitet werden"
+        assert len(handler._pending) == 1
+
+        # Scan vorbei -> naechstes Event arbeitet Puffer + neues Event ab
+        state["writable"] = True
+        handler.on_created(FakeEvent("C:/afterscan", True))
+        db.cursor.execute(
+            "SELECT COUNT(*) FROM directories WHERE full_path IN ('C:/scanlockdir','C:/afterscan')"
+        )
+        assert db.cursor.fetchone()[0] == 2, "gepuffertes UND neues Event muessen verarbeitet sein"
+        assert handler._pending == []
+
+    def test_pending_buffer_respects_max(self, handler, monkeypatch):
+        monkeypatch.setattr(handler, "_wait_for_write_window", lambda p: False)
+        handler._pending_max = 3
+        for i in range(10):
+            handler.on_created(FakeEvent(f"C:/d{i}", True))
+        assert len(handler._pending) == 3, "Puffer-Limit muss eingehalten werden"
+
+
 class TestOnDeleted:
 
     def test_delete_directory_removes_entry_and_cascades(self, handler):

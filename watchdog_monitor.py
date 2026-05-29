@@ -9,6 +9,7 @@ import time
 import sys
 import logging
 import sqlite3
+import threading
 # *** ENTFERNT: Debug-Import-Check ***
 # try:
 #     with open(DEBUG_FILE, "a") as f: f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - watchdog_monitor: Imported os, time, sys, sqlite3.\n")
@@ -207,6 +208,15 @@ class FSHandler(FileSystemEventHandler):
         self.drive_id = None # Wird bei Bedarf initialisiert
         self._last_wal_checkpoint_ts = 0.0
         self._wal_checkpoint_interval_s = float(CONFIG.get('watchdog_wal_checkpoint_interval_s', 60))
+
+        # Event-Puffer gegen Event-Loss waehrend eines Bulk-Scans (Scan-Lock):
+        # Events werden nicht verworfen, sondern gesammelt und beim naechsten
+        # Schreibfenster nachgearbeitet.
+        self._pending = []
+        self._pending_lock = threading.Lock()
+        self._pending_max = int(CONFIG.get('watchdog_pending_max', 20000))
+        self._draining = False
+
         self._initialize_db()
 
     def _initialize_db(self):
@@ -321,8 +331,65 @@ class FSHandler(FileSystemEventHandler):
         """Stoppt Event-Verarbeitung kurz, wenn gerade ein Bulk-Scan läuft."""
         if should_fs_write(timeout=0.25):
             return True
-        logger.debug(f"[Watchdog Skip] Scan-Lock aktiv, Event übersprungen: {src_path}")
+        logger.debug(f"[Watchdog Skip] Scan-Lock aktiv, Event wird gepuffert: {src_path}")
         return False
+
+    def _gate(self, kind, event):
+        """Entscheidet, ob ein Event jetzt verarbeitet wird.
+
+        Bei aktivem Scan-Lock wird das Event GEPUFFERT (nicht verworfen) und
+        False zurückgegeben. Andernfalls werden zuvor aufgelaufene Events
+        nachgearbeitet und True zurückgegeben.
+        """
+        if not self._wait_for_write_window(event.src_path):
+            self._buffer_pending(kind, event)
+            return False
+        self._drain_pending()
+        return True
+
+    def _buffer_pending(self, kind, event):
+        """Puffert ein Event, das während eines Scan-Locks aufgetreten ist."""
+        with self._pending_lock:
+            if len(self._pending) >= self._pending_max:
+                logger.warning(
+                    f"[Watchdog Pending] Puffer voll ({self._pending_max}); Event "
+                    f"verworfen: {getattr(event, 'src_path', '?')}. Nächster "
+                    "Scan/Integrity-Check stellt Konsistenz wieder her."
+                )
+                return
+            self._pending.append((kind, event))
+
+    def _drain_pending(self):
+        """Arbeitet zuvor gepufferte Events ab, sobald wieder geschrieben werden darf."""
+        if self._draining:
+            return
+        with self._pending_lock:
+            if not self._pending:
+                return
+            batch = self._pending
+            self._pending = []
+        self._draining = True
+        try:
+            handlers = {
+                "created": self.on_created,
+                "modified": self.on_modified,
+                "moved": self.on_moved,
+                "deleted": self.on_deleted,
+            }
+            logger.info(f"[Watchdog Pending] Arbeite {len(batch)} aufgelaufene Events nach.")
+            for kind, event in batch:
+                handler = handlers.get(kind)
+                if handler is None:
+                    continue
+                try:
+                    handler(event)
+                except Exception as e:
+                    logger.error(
+                        f"[Watchdog Pending] Fehler beim Nacharbeiten von {kind} "
+                        f"{getattr(event, 'src_path', '?')}: {e}"
+                    )
+        finally:
+            self._draining = False
 
     @staticmethod
     def _is_db_lock_error(exc: Exception) -> bool:
@@ -350,10 +417,9 @@ class FSHandler(FileSystemEventHandler):
 
     def on_created(self, event):
         """Behandelt das Erstellen von Dateien oder Verzeichnissen."""
-        # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
             return
-        if not self._wait_for_write_window(event.src_path):
+        if not self._gate("created", event):
             return
 
         if not self._reinitialize_db_if_needed(): return
@@ -369,10 +435,9 @@ class FSHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         """Behandelt das Ändern von Dateien."""
-        # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
             return
-        if not self._wait_for_write_window(event.src_path):
+        if not self._gate("modified", event):
             return
 
         if not self._reinitialize_db_if_needed(): return
@@ -387,10 +452,9 @@ class FSHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         """Behandelt das Verschieben/Umbenennen von Dateien oder Verzeichnissen."""
-        # *** NEU: Prüfung am Anfang (Quelle UND Ziel) ***
         if self._is_ignored(event.src_path) or self._is_ignored(event.dest_path):
             return
-        if not self._wait_for_write_window(event.src_path):
+        if not self._gate("moved", event):
             return
 
         if not self._reinitialize_db_if_needed(): return
@@ -497,10 +561,9 @@ class FSHandler(FileSystemEventHandler):
 
     def on_deleted(self, event):
         """Behandelt das Löschen von Dateien oder Verzeichnissen."""
-        # *** NEU: Prüfung am Anfang ***
         if self._is_ignored(event.src_path):
             return
-        if not self._wait_for_write_window(event.src_path):
+        if not self._gate("deleted", event):
             return
 
         if not self._reinitialize_db_if_needed(): return
