@@ -84,17 +84,11 @@ class DBManager:
                 logger.error("[DB] KRITISCH: Foreign Keys bleiben deaktiviert!")
         
         self.path = db_path
-        self.lock = threading.Lock()
-        
-        # NEU: File Cache für Performance
-        self.file_cache = FileCache()
-        
-        self.connect()
-        self.ensure_schema()
 
-    def connect(self):
-        # ... (unverändert)
-        pass # Hinzugefügt, um Einrückungsfehler zu beheben
+        # In-Memory File Cache für Performance
+        self.file_cache = FileCache()
+
+        self.ensure_schema()
 
     def with_lock(func):
         def wrapper(self, *args, **kwargs):
@@ -257,9 +251,6 @@ class DBManager:
             JOIN directories d ON f.directory_id = d.id
             LEFT JOIN extensions e ON f.extension_id = e.id
         """)
-        
-        # Standard Extensions einfügen
-        self._populate_standard_extensions()
         
         self.conn.commit()
         logger.info("[DB] Optimiertes Datenbankschema erstellt/aktualisiert.")
@@ -471,36 +462,27 @@ class DBManager:
         extension_id = self.get_or_create_extension(ext) if ext else self.get_or_create_extension('[none]')
         
         if in_cache is True:
-            # Definitiv im Cache = UPDATE
+            # Cache sagt: Datei existiert -> UPDATE. Falls die Zeile wider
+            # Erwarten fehlt (Cache-Inkonsistenz), auf INSERT zurückfallen,
+            # damit die Datei nicht verloren geht.
             self.cursor.execute("""
-                UPDATE files 
+                UPDATE files
                 SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
                 WHERE directory_id = ? AND filename = ?
             """, (size, hash_val, modified_date, directory_id, filename))
-            return self.cursor.lastrowid
-            
-        elif in_cache is False:
-            # Definitiv NICHT im Cache = INSERT
-            try:
+            if self.cursor.rowcount == 0:
                 self.cursor.execute("""
-                    INSERT INTO files 
-                    (directory_id, filename, extension_id, size, hash, created_date, modified_date) 
+                    INSERT OR IGNORE INTO files
+                    (directory_id, filename, extension_id, size, hash, created_date, modified_date)
                     VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                 """, (directory_id, filename, extension_id, size, hash_val, created_date, modified_date))
-                self.file_cache.add(directory_id, filename)
-                return self.cursor.lastrowid
-            except sqlite3.IntegrityError:
-                # Race condition oder Cache miss - UPDATE
-                self.cursor.execute("""
-                    UPDATE files 
-                    SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                    WHERE directory_id = ? AND filename = ?
-                """, (size, hash_val, modified_date, directory_id, filename))
-                self.file_cache.add(directory_id, filename)
-                return self.cursor.lastrowid
-        
+            self.file_cache.add(directory_id, filename)
+            return self.cursor.lastrowid
+
         else:
-            # Cache unbekannt (None) = Alte Logik mit DB-Check
+            # Cache unbekannt (None) = DB-Check.
+            # (FileCache.check liefert nur True oder None, nie False – ein
+            #  "definitiv nicht im Cache"-Zweig wäre toter Code.)
             # Versuche erst zu aktualisieren (wenn Datei existiert)
             self.cursor.execute("""
                 UPDATE files 
@@ -557,12 +539,9 @@ class DBManager:
                 if in_cache is True:
                     # Definitiv existiert = UPDATE
                     updates.append((size, hash_val, dir_id, filename))
-                elif in_cache is False:
-                    # Definitiv neu = INSERT
-                    inserts.append((dir_id, filename, extension_id, size, hash_val))
-                    self.file_cache.add(dir_id, filename)
                 else:
-                    # Cache unbekannt = muss einzeln geprüft werden
+                    # Cache unbekannt (None) = einzeln per DB-Check entscheiden.
+                    # (FileCache.check liefert nie False.)
                     self.cursor.execute("""
                         SELECT 1 FROM files 
                         WHERE directory_id = ? AND filename = ?
