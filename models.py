@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -13,26 +14,76 @@ _db_lock = threading.RLock()
 _db_instance = None
 _db_path = None
 
+# --- Endungs-Plausibilitaet (Root-Cause-Fix gegen extensions-Bloat) ---------
+# os.path.splitext nimmt blind alles nach dem letzten Punkt als "Endung". Bei
+# Dateinamen mit mehreren Punkten (Versionen, Datumsangaben, Hashes, Assembly-
+# Strings) entstand so Muell wie '.0', '.0-STABLE', '.luzia-UBUNTU_2,ST' oder
+# 67-Zeichen-SHA-Hashes – pro eindeutigem String eine permanente extensions-Zeile.
+# R3-Regel: Punkt + alnum-Startzeichen + bis zu 15 weitere [alnum/_/-], und es
+# muss mindestens ein Buchstabe vorkommen (verwirft rein-numerische wie '.0').
+NONE_EXT = '[none]'
+_PLAUSIBLE_EXT_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$")
+
+# scan_lock ist ein Mutex + kurze Verlaufsanzeige, KEIN Audit-Trail. acquire
+# beschneidet die inaktive Historie automatisch auf die letzten N Eintraege,
+# damit nie ein externer Cleanup noetig ist (Root-Cause-Fix gegen scan_lock-Bloat).
+SCAN_LOCK_HISTORY_KEEP = 20
+
+
+def _is_plausible_ext(ext):
+    """True, wenn ``ext`` wie eine echte Datei-Endung aussieht (R3-Regel).
+
+    Case-insensitiv (das Muster akzeptiert beide Schreibweisen). Rein-numerische
+    "Endungen" gelten immer als Muell.
+    """
+    if not ext or ext == NONE_EXT:
+        return False
+    if not _PLAUSIBLE_EXT_RE.match(ext):
+        return False
+    return any(ch.isalpha() for ch in ext)
+
+
+def split_name_ext(basename):
+    """Trennt einen Basename in (filename, ext) mit Plausibilitaets-Pruefung.
+
+    Nur eine plausible Endung (siehe :func:`_is_plausible_ext`) wird abgetrennt;
+    sonst bleibt der VOLLE Name im filename und ext == '[none]'. Gespeichert wird
+    die Originalschreibweise. Es gilt stets die Konkatenations-Invariante::
+
+        filename + (ext, falls echt) == basename
+
+    Diese Invariante ist Voraussetzung fuer die Pfad-Rekonstruktion in
+    integrity_checker.py / exporter.py (full_path/filename/e.name).
+    """
+    stem, ext = os.path.splitext(basename)
+    if _is_plausible_ext(ext):
+        return stem, ext
+    return basename, NONE_EXT
+
 class FileCache:
     """Leichtgewichtiger In-Memory Cache für existierende Dateien"""
     
     def __init__(self):
-        self.cache = {}  # (directory_id, filename) -> True
+        self.cache = {}  # (directory_id, filename, extension_id) -> True
         self.lock = threading.RLock()
         self.enabled = True
         self.max_entries = 100000  # Max 100k Einträge im Cache
-        
-    def check(self, directory_id, filename):
-        """Prüft ob Datei im Cache ist (True = existiert, None = unbekannt)"""
+
+    def check(self, directory_id, filename, extension_id=None):
+        """Prüft ob Datei im Cache ist (True = existiert, None = unbekannt).
+
+        Der Schluessel enthaelt extension_id, damit gleichnamige Dateien mit
+        verschiedener Endung (logo.png / logo.svg) NICHT als dieselbe Datei gelten.
+        """
         if not self.enabled:
             return None
         with self.lock:
-            key = (directory_id, filename)
+            key = (directory_id, filename, extension_id)
             if key in self.cache:
                 return True
             return None  # Unbekannt, nicht False
-    
-    def add(self, directory_id, filename):
+
+    def add(self, directory_id, filename, extension_id=None):
         """Fügt Datei zum Cache hinzu"""
         if not self.enabled:
             return
@@ -43,12 +94,12 @@ class FileCache:
                 to_remove = list(self.cache.keys())[:self.max_entries // 10]
                 for key in to_remove:
                     del self.cache[key]
-            self.cache[(directory_id, filename)] = True
-    
-    def remove(self, directory_id, filename):
+            self.cache[(directory_id, filename, extension_id)] = True
+
+    def remove(self, directory_id, filename, extension_id=None):
         """Entfernt Datei aus Cache"""
         with self.lock:
-            self.cache.pop((directory_id, filename), None)
+            self.cache.pop((directory_id, filename, extension_id), None)
     
     def clear(self):
         """Leert den Cache"""
@@ -166,6 +217,20 @@ class DBManager:
         
         # 6. Performance-Indizes (nach Tabellenerstellung)
         try:
+            # MIGRATION: Der UNIQUE-Index war frueher nur (directory_id, filename)
+            # OHNE extension_id. Da filename der Name OHNE Endung ist, kollidierten
+            # gleichnamige Dateien mit verschiedener Endung (logo.png vs logo.svg) und
+            # eine Datei ging per INSERT OR IGNORE verloren. Wir ersetzen den alten
+            # Index idempotent durch die 3-spaltige Variante.
+            self.cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_files_directory_filename'"
+            )
+            existing = self.cursor.fetchone()
+            if existing and existing[0] and 'extension_id' not in existing[0]:
+                logger.info("[DB] Migriere UNIQUE-Index -> (directory_id, filename, extension_id)")
+                self.cursor.execute("DROP INDEX idx_files_directory_filename")
+
             indices = [
                 "CREATE INDEX IF NOT EXISTS idx_directories_drive_path ON directories (drive_id, full_path)",
                 "CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories (parent_id)",
@@ -174,12 +239,12 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_files_directory ON files (directory_id)",
                 "CREATE INDEX IF NOT EXISTS idx_files_size ON files (size)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_extensions_name ON extensions (name)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename, extension_id)",
                 "CREATE INDEX IF NOT EXISTS idx_files_hash ON files (hash)",
                 "CREATE INDEX IF NOT EXISTS idx_extensions_category ON extensions (category)",
                 "CREATE INDEX IF NOT EXISTS idx_files_name_ext_size ON files (filename, extension_id, size)"
             ]
-            
+
             for idx_sql in indices:
                 self.cursor.execute(idx_sql)
         except sqlite3.Error as e:
@@ -347,10 +412,17 @@ class DBManager:
 
     @with_lock
     def get_or_create_extension(self, ext_name):
-        """Holt oder erstellt eine Extension-ID."""
+        """Holt oder erstellt eine Extension-ID.
+
+        Backstop gegen Bloat: unplausible Endungen (splitext-Muell) werden NICHT
+        als neue Zeile angelegt, sondern auf '[none]' abgebildet. So kann auch ein
+        Aufrufer, der split_name_ext nicht nutzt, keine Muell-Extension erzeugen.
+        """
         if not ext_name:
-            ext_name = '[none]'
-        
+            ext_name = NONE_EXT
+        elif ext_name != NONE_EXT and not _is_plausible_ext(ext_name):
+            ext_name = NONE_EXT
+
         self.cursor.execute("SELECT id FROM extensions WHERE name = ?", (ext_name,))
         row = self.cursor.fetchone()
         if row:
@@ -452,14 +524,15 @@ class DBManager:
     @with_lock
     def insert_file_optimized(self, directory_id, full_filename, size, hash_val, created_date=None, modified_date=None):
         """Optimierte Datei-Einfügung mit Cache und UNIQUE INDEX Kompatibilität."""
-        # Filename und Extension trennen
-        filename, ext = os.path.splitext(full_filename)
-        
-        # PERFORMANCE: Prüfe Cache zuerst
-        in_cache = self.file_cache.check(directory_id, filename)
-        
+        # Filename und Extension trennen (mit Plausibilitaets-Pruefung gegen Muell-Endungen)
+        filename, ext = split_name_ext(full_filename)
+
         # Extension-ID ermitteln
-        extension_id = self.get_or_create_extension(ext) if ext else self.get_or_create_extension('[none]')
+        extension_id = self.get_or_create_extension(ext)
+
+        # PERFORMANCE: Prüfe Cache zuerst (Schluessel inkl. extension_id, damit
+        # gleichnamige Dateien mit verschiedener Endung nicht kollidieren)
+        in_cache = self.file_cache.check(directory_id, filename, extension_id)
         
         if in_cache is True:
             # Cache sagt: Datei existiert -> UPDATE. Falls die Zeile wider
@@ -468,15 +541,15 @@ class DBManager:
             self.cursor.execute("""
                 UPDATE files
                 SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                WHERE directory_id = ? AND filename = ?
-            """, (size, hash_val, modified_date, directory_id, filename))
+                WHERE directory_id = ? AND filename = ? AND extension_id IS ?
+            """, (size, hash_val, modified_date, directory_id, filename, extension_id))
             if self.cursor.rowcount == 0:
                 self.cursor.execute("""
                     INSERT OR IGNORE INTO files
                     (directory_id, filename, extension_id, size, hash, created_date, modified_date)
                     VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                 """, (directory_id, filename, extension_id, size, hash_val, created_date, modified_date))
-            self.file_cache.add(directory_id, filename)
+            self.file_cache.add(directory_id, filename, extension_id)
             return self.cursor.lastrowid
 
         else:
@@ -485,24 +558,24 @@ class DBManager:
             #  "definitiv nicht im Cache"-Zweig wäre toter Code.)
             # Versuche erst zu aktualisieren (wenn Datei existiert)
             self.cursor.execute("""
-                UPDATE files 
+                UPDATE files
                 SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                WHERE directory_id = ? AND filename = ?
-            """, (size, hash_val, modified_date, directory_id, filename))
-            
+                WHERE directory_id = ? AND filename = ? AND extension_id IS ?
+            """, (size, hash_val, modified_date, directory_id, filename, extension_id))
+
             if self.cursor.rowcount > 0:
                 # UPDATE erfolgreich = Datei existierte
-                self.file_cache.add(directory_id, filename)
+                self.file_cache.add(directory_id, filename, extension_id)
             else:
                 # Keine Zeile aktualisiert = INSERT nötig
                 self.cursor.execute("""
-                    INSERT OR IGNORE INTO files 
-                    (directory_id, filename, extension_id, size, hash, created_date, modified_date) 
+                    INSERT OR IGNORE INTO files
+                    (directory_id, filename, extension_id, size, hash, created_date, modified_date)
                     VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                 """, (directory_id, filename, extension_id, size, hash_val, created_date, modified_date))
                 if self.cursor.rowcount > 0:
-                    self.file_cache.add(directory_id, filename)
-            
+                    self.file_cache.add(directory_id, filename, extension_id)
+
             return self.cursor.lastrowid
 
     @with_lock
@@ -519,13 +592,13 @@ class DBManager:
             # Konvertiere zu optimierter Struktur
             optimized_tuples = []
             for dir_id, full_filename, size, hash_val in file_tuples:
-                # Parse filename und extension
+                # Parse filename und extension (mit Plausibilitaets-Pruefung)
                 basename = os.path.basename(full_filename) if '/' in full_filename or '\\' in full_filename else full_filename
-                filename, ext = os.path.splitext(basename)
-                
+                filename, ext = split_name_ext(basename)
+
                 # Extension-ID ermitteln (Bulk-Optimierung möglich)
-                extension_id = self.get_or_create_extension(ext) if ext else self.get_or_create_extension('[none]')
-                
+                extension_id = self.get_or_create_extension(ext)
+
                 optimized_tuples.append((dir_id, filename, extension_id, size, hash_val))
             
             # Batch-Insert in optimierte Tabelle mit Cache-Unterstützung
@@ -533,34 +606,35 @@ class DBManager:
             inserts = []
             
             for dir_id, filename, extension_id, size, hash_val in optimized_tuples:
-                # Prüfe Cache für bessere Performance
-                in_cache = self.file_cache.check(dir_id, filename)
-                
+                # Prüfe Cache für bessere Performance (Schluessel inkl. extension_id,
+                # sonst kollidieren gleichnamige Dateien mit verschiedener Endung)
+                in_cache = self.file_cache.check(dir_id, filename, extension_id)
+
                 if in_cache is True:
                     # Definitiv existiert = UPDATE
-                    updates.append((size, hash_val, dir_id, filename))
+                    updates.append((size, hash_val, dir_id, filename, extension_id))
                 else:
                     # Cache unbekannt (None) = einzeln per DB-Check entscheiden.
                     # (FileCache.check liefert nie False.)
                     self.cursor.execute("""
-                        SELECT 1 FROM files 
-                        WHERE directory_id = ? AND filename = ?
+                        SELECT 1 FROM files
+                        WHERE directory_id = ? AND filename = ? AND extension_id IS ?
                         LIMIT 1
-                    """, (dir_id, filename))
-                    
+                    """, (dir_id, filename, extension_id))
+
                     if self.cursor.fetchone():
-                        updates.append((size, hash_val, dir_id, filename))
-                        self.file_cache.add(dir_id, filename)
+                        updates.append((size, hash_val, dir_id, filename, extension_id))
+                        self.file_cache.add(dir_id, filename, extension_id)
                     else:
                         inserts.append((dir_id, filename, extension_id, size, hash_val))
-                        self.file_cache.add(dir_id, filename)
-            
+                        self.file_cache.add(dir_id, filename, extension_id)
+
             # Batch-UPDATE
             if updates:
                 self.cursor.executemany("""
-                    UPDATE files 
+                    UPDATE files
                     SET size = ?, hash = ?, modified_date = datetime('now')
-                    WHERE directory_id = ? AND filename = ?
+                    WHERE directory_id = ? AND filename = ? AND extension_id IS ?
                 """, updates)
             
             # Batch-INSERT
@@ -777,12 +851,15 @@ class DBManager:
                 logger.warning(f"[DB] Kann Scan-Lock nicht erwerben, aktiver Scan im Gange: {lock_type} (PID: {lock_pid}@{lock_hostname}, Start: {lock_time})")
                 return None
         
-        # Kein aktiver Scan, wir können einen Lock erwerben
+        # Kein aktiver Scan, wir können einen Lock erwerben.
+        # Vorher: inaktive Historie selbst beschneiden (kein externer Cleanup noetig).
+        self.cleanup_scan_lock_history(keep_recent=SCAN_LOCK_HISTORY_KEEP)
+
         import socket, os, datetime
         current_time = datetime.datetime.now().isoformat()
         current_pid = os.getpid()
         current_hostname = socket.gethostname()
-        
+
         self.cursor.execute(
             "INSERT INTO scan_lock (scan_type, start_time, pid, hostname, is_active) VALUES (?, ?, ?, ?, 1)",
             (scan_type, current_time, current_pid, current_hostname)

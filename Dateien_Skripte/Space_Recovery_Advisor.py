@@ -667,9 +667,10 @@ class MergeThread(QThread):
 
                     # DB-Eintrag anlegen
                     try:
-                        base, ext = os.path.splitext(fname)
-                        if not ext:
-                            ext = '[none]'
+                        # Gleiche Endungs-Plausibilitaet wie der Scanner: verhindert
+                        # Muell-Endungen (.0, Hashes) und gleichnamige-Datei-Kollisionen.
+                        from models import split_name_ext
+                        base, ext = split_name_ext(fname)
 
                         # Extension-ID holen
                         c.execute("SELECT id FROM extensions WHERE name = ?", (ext,))

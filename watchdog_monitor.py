@@ -64,7 +64,7 @@ except Exception as utils_ex:
     raise # Fehler weiter werfen, damit Hauptskript ihn bemerkt
 
 try:
-    from models import get_db_instance, _db_lock
+    from models import get_db_instance, _db_lock, split_name_ext
     # *** ENTFERNT: Debug-Import-Check ***
     # with open(DEBUG_FILE, "a") as f: f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - watchdog_monitor: Imported from models.\n")
 except Exception as models_ex:
@@ -479,8 +479,9 @@ class FSHandler(FileSystemEventHandler):
                     dest_dir = os.path.dirname(dest_path)
 
                     # Finde die Datei in der optimierten Struktur
-                    src_filename_only, src_ext = os.path.splitext(src_filename)
-                    src_ext = src_ext if src_ext else '[none]'
+                    # (split_name_ext: identische Endungs-Logik wie der Scanner,
+                    #  sonst verfehlt der Lookup gehaertete filename/extension)
+                    src_filename_only, src_ext = split_name_ext(src_filename)
 
                     # Finde die alte directory_id
                     self.db.cursor.execute("SELECT id FROM directories WHERE drive_id = ? AND full_path = ?", (self.drive_id, src_dir.replace("\\", "/")))
@@ -512,8 +513,7 @@ class FSHandler(FileSystemEventHandler):
                     dest_dir_id = self.db.get_or_create_directory_optimized(self.drive_id, dest_dir.replace("\\", "/"))
 
                     # Parse neuen Dateinamen
-                    dest_filename_only, dest_ext = os.path.splitext(dest_filename)
-                    dest_ext = dest_ext if dest_ext else '[none]'
+                    dest_filename_only, dest_ext = split_name_ext(dest_filename)
                     dest_ext_id = self.db.get_or_create_extension(dest_ext)
 
                     # Ziel kann bei temp->final Moves bereits als separates Event existieren.
@@ -588,8 +588,7 @@ class FSHandler(FileSystemEventHandler):
                         # Lösche Datei-Eintrag - neue Struktur
                         filename = os.path.basename(src_path)
                         dir_path = os.path.dirname(src_path)
-                        filename_only, ext = os.path.splitext(filename)
-                        ext = ext if ext else '[none]'
+                        filename_only, ext = split_name_ext(filename)
 
                         # SQL mit JOIN für optimierte Struktur
                         delete_sql = """
@@ -719,8 +718,7 @@ class FSHandler(FileSystemEventHandler):
                     # Prüfen ob Datei noch existiert und lesbar ist
                     if not os.path.isfile(abs_path):
                         logger.warning(f"[Watchdog Update-Info] Datei nicht (mehr) vorhanden oder kein Zugriff: {abs_path}")
-                        filename_only, ext = os.path.splitext(filename)
-                        ext = ext if ext else '[none]'
+                        filename_only, ext = split_name_ext(filename)
                         ext_id = self.db.get_or_create_extension(ext)
                         deleted_rows = self.db.cursor.execute(
                             "DELETE FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ?",
@@ -748,8 +746,7 @@ class FSHandler(FileSystemEventHandler):
                     # Daher Existenz im Zielslot prüfen, bevor wir einen Fehler loggen.
                     op_ok = bool(file_id)
                     if not op_ok:
-                        filename_only, ext = os.path.splitext(filename)
-                        ext = ext if ext else '[none]'
+                        filename_only, ext = split_name_ext(filename)
                         ext_id = self.db.get_or_create_extension(ext)
                         self.db.cursor.execute(
                             "SELECT id FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ?",
@@ -772,8 +769,7 @@ class FSHandler(FileSystemEventHandler):
                 # Race Condition: Datei zwischen Event und Zugriff verschwunden
                 with _db_lock:
                     try:
-                        filename_only, ext = os.path.splitext(filename)
-                        ext = ext if ext else '[none]'
+                        filename_only, ext = split_name_ext(filename)
                         dir_id = self.db.get_or_create_directory_optimized(self.drive_id, dir_path.replace("\\", "/"))
                         if dir_id:
                             ext_id = self.db.get_or_create_extension(ext)

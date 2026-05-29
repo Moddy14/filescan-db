@@ -27,6 +27,28 @@ except TypeError:
     logger = logging.getLogger("ScanAllDrives_Fallback")
 
 
+def classify_scan_exit_code(returncode):
+    """Bildet den Exit-Code von scanner_core.py auf einen Status ab.
+
+    scanner_core.py-Konvention:
+        0 = Scan erfolgreich
+        3 = Scan-Lock konnte nicht erworben werden (ein ANDERER Scan läuft) -> skipped
+        sonst (insb. 1 = run_scan() lieferte False) = FATALER Fehler -> failed
+
+    Frueher wurde Exit 1 faelschlich als "skipped" und Exit 3 als "failed"
+    interpretiert (vertauscht), wodurch echte Hard-Fails als harmlose Skips
+    gemeldet wurden.
+
+    Returns:
+        str: "success" | "skipped" | "failed"
+    """
+    if returncode == 0:
+        return "success"
+    if returncode == 3:
+        return "skipped"
+    return "failed"
+
+
 def run_scan_for_drive(drive_path):
     """Führt scanner_core.py für ein bestimmtes Laufwerk mit --restart aus.
 
@@ -64,15 +86,17 @@ def run_scan_for_drive(drive_path):
         return "success"
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"Scan für {drive_path} fehlgeschlagen (Exit Code: {e.returncode}).")
+        status = classify_scan_exit_code(e.returncode)
+        if status == "skipped":
+            # Exit 3: scanner_core konnte den Scan-Lock nicht erwerben -> anderer Scan lief
+            logger.warning(f"Laufwerk {drive_path} übersprungen (ein anderer Scan läuft bereits, Exit Code {e.returncode}).")
+            return "skipped"
+        # Exit 1 (oder sonstiger Code): echter, fataler Scan-Fehler
+        logger.error(f"Scan für {drive_path} FEHLGESCHLAGEN (Exit Code: {e.returncode}).")
         if e.stderr:
             logger.error(f"Stderr:\n{e.stderr}")
         if e.stdout:
             logger.error(f"Stdout:\n{e.stdout}")
-        # Bei Exit Code 1: Warnung statt Fehler (könnte Zugriffsrechte sein)
-        if e.returncode == 1:
-            logger.warning(f"Laufwerk {drive_path} übersprungen (möglicherweise Zugriffsrechte oder leer)")
-            return "skipped"
         return "failed"
     except Exception as e:
         logger.error(f"Unerwarteter Fehler beim Ausführen des Scans für {drive_path}: {e}")
@@ -180,6 +204,12 @@ def main():
     # Lockdatei am Ende immer entfernen (auch bei Teilfehlern)
     if _scan_lock_imported:
         remove_scan_lockfile()
+
+    # Exit-Code spiegelt FATALE Laufwerks-Fehler wider, damit Aufrufer
+    # (scheduled_scanner-Log etc.) einen echten Fehlschlag erkennen koennen.
+    # 'skipped' (anderer Scan lief) ist KEIN Fehler und beeinflusst den Code nicht.
+    if failed_drives:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

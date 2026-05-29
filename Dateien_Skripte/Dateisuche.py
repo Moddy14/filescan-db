@@ -1051,30 +1051,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         # DB aktualisieren (wie zuvor)
         try:
-            # Angepasst für optimierte Datenbankstruktur - filename und extension trennen
-            filename_only, ext = os.path.splitext(new_name)
-            ext = ext if ext else None
-            
+            # Optimierte DB-Struktur: identische Endungs-Logik wie der Scanner.
+            # split_name_ext haelt die Invariante filename+ext == Name (auch bei
+            # Muell-Endungen -> voller Name bleibt im filename, ext='[none]') und
+            # get_or_create_extension ist der zentrale Chokepoint gegen Bloat.
+            from models import get_db_instance, split_name_ext
+            filename_only, ext = split_name_ext(new_name)
+
             cursor = self.conn.cursor()
-            
-            # Extension-ID ermitteln
-            if ext:
-                cursor.execute("SELECT id FROM extensions WHERE name = ?", (ext,))
-                ext_row = cursor.fetchone()
-                if ext_row:
-                    ext_id = ext_row[0]
-                else:
-                    # Neue Extension erstellen
-                    from models import get_db_instance
-                    db_manager = get_db_instance()
-                    ext_id = db_manager.get_or_create_extension(ext)
-            else:
-                cursor.execute("SELECT id FROM extensions WHERE name = '[none]'")
-                ext_row = cursor.fetchone()
-                ext_id = ext_row[0] if ext_row else None
-            
+            ext_id = get_db_instance().get_or_create_extension(ext)
+
             # Datei-Eintrag aktualisieren
-            cursor.execute("UPDATE files SET filename = ?, extension_id = ? WHERE id = ?", 
+            cursor.execute("UPDATE files SET filename = ?, extension_id = ? WHERE id = ?",
                           (filename_only, ext_id, info["id"]))
             self.conn.commit()
             QtWidgets.QMessageBox.information(self, "Erfolg", "Datei umbenannt (physisch und in DB aktualisiert).")
