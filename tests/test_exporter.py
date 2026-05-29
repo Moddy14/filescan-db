@@ -126,6 +126,24 @@ class TestExporterHelpers:
     # export_all integration
     # ------------------------------------------------------------------
 
+    def test_export_path_without_extension_has_no_none_suffix(self, tmp_path, in_memory_db):
+        """Extensionslose Dateien duerfen im Export keinen '[none]'-Suffix tragen."""
+        import json
+        import exporter
+        db = in_memory_db
+        drive_id = db.get_or_create_drive("C:/")
+        dir_id = db.get_or_create_directory(drive_id, "C:/Docs")
+        db.batch_insert_files([(dir_id, "Makefile", 5, None)])
+        db.conn.commit()
+
+        out = str(tmp_path / "noext.json")
+        exporter.export_json(exporter.fetch_file_data(db.cursor), out)
+        data = json.load(open(out, encoding="utf-8"))
+        paths = [r["file_path"] for r in data]
+
+        assert any("Makefile" in p for p in paths)
+        assert not any("[none]" in p for p in paths), "kein [none]-Suffix im Export-Pfad"
+
     def test_export_all_produces_files(self, tmp_path, monkeypatch, sample_cursor):
         """export_all() must write at least one file per enabled format.
 
