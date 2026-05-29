@@ -768,33 +768,13 @@ class MainWindow(QMainWindow):
     def get_detailed_scan_status(self):
         """Holt detaillierte Informationen über laufende Scans."""
         try:
-            import sqlite3
             import socket
             import datetime
-            
-            db_uri = "file:" + DB_PATH.replace("\\", "/") + "?mode=ro"
-            conn = sqlite3.connect(db_uri, uri=True, timeout=15.0)
-            conn.execute("PRAGMA query_only = ON")
-            cursor = conn.cursor()
-            
-            # Hole aktive Scan-Locks
-            cursor.execute("""
-                SELECT scan_type, start_time, pid, hostname 
-                FROM scan_lock 
-                WHERE is_active = 1
-                ORDER BY start_time DESC
-            """)
-            active_scans = cursor.fetchall()
-            
-            # Hole Scan-Progress Einträge
-            cursor.execute("""
-                SELECT sp.drive_id, sp.last_path, sp.timestamp, d.name
-                FROM scan_progress sp
-                LEFT JOIN drives d ON sp.drive_id = d.id
-            """)
-            progress_entries = cursor.fetchall()
-            
-            conn.close()
+
+            # DB-Abfrage ausgelagert nach gui_data (cursor-isoliert, getestet)
+            status = gui_data.get_scan_status(get_db_instance())
+            active_scans = status["active_scans"]
+            progress_entries = status["progress"]
             
             # Formatiere die Ausgabe
             details = []

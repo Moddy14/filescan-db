@@ -71,6 +71,33 @@ def get_drive_overview(db, drive_name):
         cursor.close()
 
 
+def get_scan_status(db):
+    """Liefert aktive Scan-Locks und Scan-Progress als strukturierte Daten.
+
+    Verwendet einen eigenen Cursor (berührt den geteilten db.cursor nicht).
+
+    Returns:
+        dict mit:
+            active_scans: Liste von (scan_type, start_time, pid, hostname)
+            progress:     Liste von (drive_id, last_path, timestamp, drive_name)
+    """
+    cursor = db.conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT scan_type, start_time, pid, hostname FROM scan_lock "
+            "WHERE is_active = 1 ORDER BY start_time DESC"
+        )
+        active_scans = cursor.fetchall()
+        cursor.execute(
+            "SELECT sp.drive_id, sp.last_path, sp.timestamp, d.name "
+            "FROM scan_progress sp LEFT JOIN drives d ON sp.drive_id = d.id"
+        )
+        progress = cursor.fetchall()
+        return {"active_scans": active_scans, "progress": progress}
+    finally:
+        cursor.close()
+
+
 def clean_orphaned_locks(db):
     """Setzt alle aktiven Scan-Locks inaktiv und entfernt Scan-Progress-Einträge.
 

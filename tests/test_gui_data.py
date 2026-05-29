@@ -69,3 +69,28 @@ class TestGetDriveOverview:
         # der geteilte Cursor muss weiterhin sein eigenes Ergebnis liefern
         rows = db.cursor.fetchall()
         assert any(r[0] == "C:/" for r in rows)
+
+
+class TestGetScanStatus:
+
+    def test_empty(self, in_memory_db):
+        import gui_data
+        st = gui_data.get_scan_status(in_memory_db)
+        assert st["active_scans"] == []
+        assert st["progress"] == []
+
+    def test_with_lock_and_progress(self, in_memory_db):
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        db.update_scan_progress(drive, "C:/somewhere")
+        db.acquire_scan_lock("manual")
+
+        import gui_data
+        st = gui_data.get_scan_status(db)
+
+        assert len(st["active_scans"]) == 1
+        assert st["active_scans"][0][0] == "manual"  # scan_type
+        assert len(st["progress"]) == 1
+        # (drive_id, last_path, timestamp, drive_name)
+        assert st["progress"][0][1] == "C:/somewhere"
+        assert st["progress"][0][3] == "C:/"
