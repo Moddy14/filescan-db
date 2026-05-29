@@ -8,6 +8,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QLabel, QListWidget, QPushButton, QFileDialog, QHBoxLayout, QListWidgetItem, QMessageBox, QApplication, QMainWindow, QWidget, QProgressBar, QTreeView, QFileSystemModel, QTextEdit, QDialogButtonBox, QMenu, QAction, QHeaderView, QComboBox, QTableWidget, QTableWidgetItem, QTimeEdit, QAbstractItemView, QInputDialog
 from models import get_db_instance
 import gui_data
+import gui_services
 import hashlib
 import json
 from datetime import datetime
@@ -134,34 +135,14 @@ class MainWindow(QMainWindow):
                 logger.error(f"[GUI] Fehler beim Abfragen von Dienst '{SERVICE_NAME}'. Exit code: {result.returncode}. Output: {result.stderr or result.stdout}")
                 return "ERROR"
 
-            # Suche nach dem STATE
-            for line in output.splitlines():
-                if "state" in line: # Zeile enthält den Status
-                    state_line = line.lower() # Sicherstellen, dass alles klein ist
-                    if "running" in state_line:
-                        return "RUNNING"
-                    elif "paused" in state_line:
-                        # Prüfe ob trotz pausiertem Dienst ein Watchdog-Prozess läuft
-                        if self.is_watchdog_process_running():
-                            logger.info("[GUI] Dienst ist pausiert, aber Watchdog-Prozess läuft")
-                            return "RUNNING_AS_PROCESS"
-                        return "PAUSED"
-                    elif "stopped" in state_line:
-                        return "STOPPED"
-                    # NEU: Pending-Status erkennen
-                    elif "start_pending" in state_line:
-                        return "START_PENDING"
-                    elif "stop_pending" in state_line:
-                        return "STOP_PENDING"
-                    elif "continue_pending" in state_line:
-                        return "CONTINUE_PENDING"
-                    elif "pause_pending" in state_line:
-                        return "PAUSE_PENDING"
-                    # Fallback, falls ein unerwarteter STATE auftritt
-                    logger.warning(f"[GUI] Unbekannter Dienst-STATE in Zeile gefunden: {line.strip()}")
-                    return "UNKNOWN" 
-            logger.warning(f"[GUI] Konnte Status für Dienst '{SERVICE_NAME}' nicht aus der Ausgabe parsen: {output}")
-            return "UNKNOWN" # Status konnte nicht ermittelt werden
+            # Status parsen (ausgelagert nach gui_services, automatisiert testbar)
+            state = gui_services.parse_service_state(output)
+            if state == "PAUSED" and self.is_watchdog_process_running():
+                logger.info("[GUI] Dienst ist pausiert, aber Watchdog-Prozess läuft")
+                return "RUNNING_AS_PROCESS"
+            if state == "UNKNOWN":
+                logger.warning(f"[GUI] Konnte Status für Dienst '{SERVICE_NAME}' nicht eindeutig parsen: {output}")
+            return state
 
         except FileNotFoundError:
             logger.error(f"[GUI] Befehl 'sc' nicht gefunden. Kann Dienststatus nicht prüfen.")
