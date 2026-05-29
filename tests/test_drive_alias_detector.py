@@ -2,6 +2,7 @@
 tests/test_drive_alias_detector.py – Unit tests for drive_alias_detector.py
 """
 
+import os
 import pytest
 
 
@@ -41,3 +42,45 @@ class TestNormalizePathWithAliases:
         # (behaviour depends on implementation; just assert no crash)
         assert isinstance(is_alias, bool)
         assert isinstance(norm, str)
+
+
+class TestSubstScenario:
+    """Echtes subst-Szenario dieser Umgebung: T: -> C:\\Laufwerk T\\USB16GB."""
+
+    def test_t_resolves_to_c(self):
+        from drive_alias_detector import normalize_path_with_aliases
+        mappings = {"T:": r"C:\Laufwerk T\USB16GB"}
+        norm, is_alias, orig, real = normalize_path_with_aliases(r"T:\Programme\test", mappings)
+        assert is_alias is True
+        assert orig == "T:"
+        assert real == "C:"
+        assert norm == os.path.normpath(r"C:\Laufwerk T\USB16GB\Programme\test")
+
+    def test_alias_root_only(self):
+        from drive_alias_detector import normalize_path_with_aliases
+        mappings = {"T:": r"C:\Laufwerk T\USB16GB"}
+        norm, is_alias, orig, real = normalize_path_with_aliases("T:\\", mappings)
+        assert is_alias is True
+        assert real == "C:"
+
+    def test_non_alias_drive_passthrough(self):
+        from drive_alias_detector import normalize_path_with_aliases
+        mappings = {"T:": r"C:\Laufwerk T\USB16GB"}
+        norm, is_alias, orig, real = normalize_path_with_aliases(r"D:\data\x", mappings)
+        assert is_alias is False
+        assert orig == "D:"
+
+
+class TestIsPathAliasOf:
+
+    def test_alias_and_real_path_match(self, monkeypatch):
+        import drive_alias_detector as dad
+        monkeypatch.setattr(dad, "get_drive_mapping",
+                            lambda: {"T:": r"C:\Laufwerk T\USB16GB"})
+        assert dad.is_path_alias_of(r"T:\Programme\x",
+                                    r"C:\Laufwerk T\USB16GB\Programme\x") is True
+
+    def test_unrelated_paths_not_alias(self, monkeypatch):
+        import drive_alias_detector as dad
+        monkeypatch.setattr(dad, "get_drive_mapping", lambda: {})
+        assert dad.is_path_alias_of(r"C:\a", r"C:\b") is False
