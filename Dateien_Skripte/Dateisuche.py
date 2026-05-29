@@ -99,8 +99,9 @@ class SearchWorker(QThread):
         self.debug_log.emit("=" * 60)
         self.debug_log.emit(f"🔍 SUCHE GESTARTET - {datetime.datetime.now().strftime('%H:%M:%S')}")
         self.debug_log.emit(f"📂 Datenbank: {self.db_path}")
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA foreign_keys = ON")  # Foreign Keys aktivieren
+        db_uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=30.0)
+        conn.execute("PRAGMA query_only = ON")
         (
             path_query, name_queries, name_ops, size_op, size_val1, size_val2, size_unit,
             qdate_val1, qdate_val2, date_op, size_units

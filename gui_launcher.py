@@ -771,7 +771,9 @@ class MainWindow(QMainWindow):
             import socket
             import datetime
             
-            conn = sqlite3.connect(DB_PATH)
+            db_uri = "file:" + DB_PATH.replace("\\", "/") + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=15.0)
+            conn.execute("PRAGMA query_only = ON")
             cursor = conn.cursor()
             
             # Hole aktive Scan-Locks

@@ -102,8 +102,8 @@ IGNORE_DIR_PREFIXES = [p for p in IGNORE_DIR_PREFIXES if p]
 
 # Dateiendungen, die oft temporär oder System-bezogen sind
 IGNORE_EXTENSIONS = [
-    ".tmp", ".log", ".etl", ".pf", ".lnk", ".ini", ".bak", ".cache", ".part", ".crdownload", 
-    ".db-shm", ".db-wal", ".db-journal"  # Explizit SQLite-Dateien ignorieren
+    ".tmp", ".log", ".etl", ".pf", ".lnk", ".ini", ".bak", ".cache", ".part", ".crdownload", ".$$$",
+    ".db-shm", ".db-wal", ".db-journal", ".pyc"  # Explizit SQLite-/Bytecode-Dateien ignorieren
 ]
 
 # Spezifische Dateien zum Ignorieren (zusätzlich zu LOG_PATH)
@@ -113,6 +113,68 @@ IGNORE_FILES = [
     os.path.normpath(DB_PATH + "-shm").lower(),  # SQLite shared memory file
     os.path.normpath(DB_PATH + "-wal").lower(),  # SQLite write-ahead log
     os.path.normpath(DB_PATH + "-journal").lower()  # SQLite journal file
+]
+
+# Laufzeit-/Cache-Churn, der als "Datei-Lärm" für DateiDB keinen Mehrwert bringt.
+# Wichtig: bewusst als substring-Muster, damit es unabhängig vom Service-User-Profil
+# (LocalSystem vs. Moddy) trotzdem greift.
+IGNORE_PATH_CONTAINS = [
+    "\\appdata\\local\\temp\\codex-index-",
+    "\\appdata\\local\\temp\\",
+    "\\users\\moddy\\.codex\\runtimes\\",
+    "\\users\\moddy\\.codex\\logs_2.sqlite",
+    "\\users\\moddy\\.codex\\version.json",
+    "\\appdata\\local\\microsoft\\windows\\powershell\\startupprofiledata-noninteractive",
+    "\\appdata\\local\\packages\\5319275a.whatsappdesktop_",
+    "\\appdata\\roaming\\telegram desktop\\tdata\\",
+    "\\appdata\\roaming\\telegram desktop\\telegram.exe",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\platform notifications\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\crashpad\\",
+    "\\appdata\\local\\nvidia corporation\\nvidia overlay\\cefcache\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\indexeddb\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\local extension settings\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\code cache\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\entityextraction\\",
+    "\\program files (x86)\\microsoft\\edge\\application\\",
+    "\\appdata\\local\\microsoft\\identitycache\\",
+    "\\appdata\\local\\microsoft\\onedrive\\logs\\",
+    "\\appdata\\local\\packages\\microsoft.windows.contentdeliverymanager_",
+    "\\program files\\common files\\acronis\\agent\\bin\\",
+    # Zusätzlicher Runtime-Lärm (nach Live-Restart 2026-05-08)
+    "\\appdata\\local\\packages\\openai.codex_",
+    "\\appdata\\local\\packages\\openai.chatgpt-desktop_",
+    "\\appdata\\roaming\\claude\\sentry\\",
+    "\\appdata\\roaming\\claude\\network\\",
+    "\\appdata\\roaming\\claude\\indexeddb\\",
+    "\\appdata\\roaming\\claude\\webstorage\\",
+    "\\appdata\\roaming\\claude\\config.json.tmp-",
+    "\\appdata\\roaming\\termius\\webstorage\\",
+    "\\appdata\\roaming\\microsoft\\windows\\powershell\\psreadline\\consolehost_history.txt",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\network\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\dnr extension rules\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\safe browsing\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\webstorage\\",
+    "\\appdata\\local\\microsoft\\edge\\user data\\default\\preferences",
+    "\\appdata\\local\\microsoft\\edge\\user data\\local state",
+    "\\appdata\\local\\docker\\wsl\\disk\\docker_data.vhdx",
+    "\\users\\moddy\\.docker\\.tmp-",
+    "\\appdata\\roaming\\docker\\.tmp-settings-store.json",
+    "\\.docker\\buildx\\.tmp-current",
+    "\\wsl\\ubuntu\\ext4.vhdx",
+    "\\ac\\temp\\casesensitivetest",
+    "\\appdata\\roaming\\code\\user\\globalstorage\\state.vscdb-journal",
+    "\\appdata\\roaming\\code\\user\\globalstorage\\state.vscdb",
+    "\\appdata\\roaming\\code\\user\\workspacestorage\\",
+    "\\program files\\common files\\norton\\icarus\\",
+    "\\program files\\syncovery\\",
+    "\\program files\\windowsapps\\microsoft.languageexperiencepackde-de_",
+    "\\system volume information\\masterfilestatus.db",
+    "\\.git\\objects\\",
+    "\\.git\\index.lock",
+    "\\appdata\\roaming\\microsoft\\windows\\recent\\customdestinations\\",
+    "\\dateidb\\scanner_portable\\watchdog_startup_report.txt",
+    "\\dateidb\\scanner_portable\\.scheduled_last_runs.json",
+    "\\projekte\\virtuellepythons\\clipboardmanager\\dist\\clipboard.db",
 ]
 
 # --- Spezifische Pfade, die auf jeden Fall ignoriert werden sollen ---
@@ -143,6 +205,8 @@ class FSHandler(FileSystemEventHandler):
         
         self.db = None # Wird bei Bedarf initialisiert
         self.drive_id = None # Wird bei Bedarf initialisiert
+        self._last_wal_checkpoint_ts = 0.0
+        self._wal_checkpoint_interval_s = float(CONFIG.get('watchdog_wal_checkpoint_interval_s', 60))
         self._initialize_db()
 
     def _initialize_db(self):
@@ -232,7 +296,12 @@ class FSHandler(FileSystemEventHandler):
                      # logger.debug(f"[Ignoriert] Papierkorb-Pfad: {path}")
                      return True
 
-            # 3. Prüfe Dateiendungen (nur wenn es keine Directory ist)
+            # 3. Prüfe substring-Muster (profilunabhängige Lärm-Pfade)
+            for needle in IGNORE_PATH_CONTAINS:
+                if needle and needle in norm_path:
+                    return True
+
+            # 4. Prüfe Dateiendungen (nur wenn es keine Directory ist)
             # Vorsicht: os.path.isdir kann fehlschlagen, wenn Datei nicht mehr existiert (bei on_deleted)
             # Wir prüfen daher nur die Endung, auch wenn es ein Ordner mit Punkt sein könnte.
             _, ext = os.path.splitext(norm_path)
@@ -263,7 +332,21 @@ class FSHandler(FileSystemEventHandler):
             or "database is locked" in msg
             or "database schema is locked" in msg
             or "database busy" in msg
+            or "cannot operate on a closed database" in msg
+            or "recursive use of cursors not allowed" in msg
         )
+
+    def _checkpoint_if_due(self, reason: str):
+        """Drosselt WAL-Checkpointing, um Lock-Stürme durch Event-Bursts zu vermeiden."""
+        now = time.time()
+        if now - self._last_wal_checkpoint_ts < self._wal_checkpoint_interval_s:
+            return
+        try:
+            self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            self._last_wal_checkpoint_ts = now
+            logger.debug(f"[Watchdog Checkpoint] PASSIVE checkpoint nach {reason}")
+        except Exception as e:
+            logger.warning(f"[Watchdog Checkpoint] Fehler bei PASSIVE checkpoint nach {reason}: {e}")
 
     def on_created(self, event):
         """Behandelt das Erstellen von Dateien oder Verzeichnissen."""
@@ -368,6 +451,20 @@ class FSHandler(FileSystemEventHandler):
                     dest_ext = dest_ext if dest_ext else '[none]'
                     dest_ext_id = self.db.get_or_create_extension(dest_ext)
 
+                    # Ziel kann bei temp->final Moves bereits als separates Event existieren.
+                    # Dann Quellzeile entfernen statt UNIQUE-Fehler zu erzeugen.
+                    self.db.cursor.execute(
+                        "SELECT id FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ?",
+                        (dest_dir_id, dest_filename_only, dest_ext_id)
+                    )
+                    dest_row = self.db.cursor.fetchone()
+                    if dest_row and dest_row[0] != file_id:
+                        self.db.cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+                        self.db.conn.commit()
+                        self._checkpoint_if_due("MoveDedupe")
+                        logger.info(f"[Watchdog Move] Ziel existierte bereits, Quell-Eintrag entfernt: {src_path} -> {dest_path}")
+                        return
+
                     # Update die Datei
                     self.db.cursor.execute(
                         "UPDATE files SET directory_id = ?, filename = ?, extension_id = ? WHERE id = ?",
@@ -375,7 +472,7 @@ class FSHandler(FileSystemEventHandler):
                     )
 
                     self.db.conn.commit()
-                    self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    self._checkpoint_if_due("Move")
                     logger.info(f"[Watchdog Move] Datei verschoben/umbenannt: {src_path} -> {dest_path}")
                     return
 
@@ -446,8 +543,7 @@ class FSHandler(FileSystemEventHandler):
                     # Nur committen, wenn etwas gelöscht wurde und kein Fehler auftrat
                     if deleted_rows > 0:
                         self.db.conn.commit()
-                        # REAL-TIME FIX: Force WAL Checkpoint für sofortige Sichtbarkeit
-                        self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        self._checkpoint_if_due("Delete")
                     return
 
                 except sqlite3.Error as e:
@@ -507,7 +603,7 @@ class FSHandler(FileSystemEventHandler):
                         ).rowcount
                         if deleted_rows > 0:
                             self.db.conn.commit()
-                            self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                            self._checkpoint_if_due("UpdateMissingFile")
                             logger.info(f"[Watchdog Update] Fehlenden Dateieintrag entfernt: {abs_path}")
                         return
 
@@ -521,9 +617,24 @@ class FSHandler(FileSystemEventHandler):
                         dir_id, filename, size, hash_val,
                         created_date=None, modified_date=None
                     )
-                    if file_id:
+
+                    # insert_file_optimized kann bei UPDATE/IGNORE einen falsy Rückgabewert liefern,
+                    # obwohl der Datensatz korrekt vorhanden/aktualisiert ist.
+                    # Daher Existenz im Zielslot prüfen, bevor wir einen Fehler loggen.
+                    op_ok = bool(file_id)
+                    if not op_ok:
+                        filename_only, ext = os.path.splitext(filename)
+                        ext = ext if ext else '[none]'
+                        ext_id = self.db.get_or_create_extension(ext)
+                        self.db.cursor.execute(
+                            "SELECT id FROM files WHERE directory_id = ? AND filename = ? AND extension_id = ?",
+                            (dir_id, filename_only, ext_id)
+                        )
+                        op_ok = self.db.cursor.fetchone() is not None
+
+                    if op_ok:
                         self.db.conn.commit()
-                        self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        self._checkpoint_if_due("UpdateInsert")
                         logger.info(f"[Watchdog Update] Datei hinzugefügt/geändert: {abs_path} (Size: {size}, Hash: {hash_val[:8] if hash_val else 'N/A'})")
                     else:
                         logger.warning(f"[Watchdog Update] Datei-Einfügung fehlgeschlagen: {abs_path}")
@@ -547,7 +658,7 @@ class FSHandler(FileSystemEventHandler):
                             ).rowcount
                             if deleted_rows > 0:
                                 self.db.conn.commit()
-                                self.db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                                self._checkpoint_if_due("UpdateRaceDelete")
                                 logger.info(f"[Watchdog Update] Fehlenden Dateieintrag entfernt: {abs_path}")
                     except Exception:
                         pass

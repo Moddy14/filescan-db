@@ -179,7 +179,9 @@ class EnhancedSearchWorker(QThread):
             self.debug_log.emit(f"\n📋 SUCHKRITERIEN:")
             for key, val in self.search_criteria.items():
                 self.debug_log.emit(f"   {key}: {repr(val)}")
-            conn = sqlite3.connect(self.db_path)
+            db_uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=30.0)
+            conn.execute("PRAGMA query_only = ON")
             cursor = conn.cursor()
             
             # Basis-Query für optimierte Datenbankstruktur
@@ -358,7 +360,9 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
 
     def connect_db(self):
         try:
-            self.conn = sqlite3.connect(self.db_path)
+            db_uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
+            self.conn = sqlite3.connect(db_uri, uri=True, timeout=30.0)
+            self.conn.execute("PRAGMA query_only = ON")
         except sqlite3.Error as e:
             QtWidgets.QMessageBox.critical(self, "DB Fehler", f"Fehler beim Verbinden zur DB: {e}")
             sys.exit(1)

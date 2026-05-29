@@ -11,6 +11,11 @@ import logging
 from utils import DB_PATH, CONFIG, PROJECT_DIR, logger
 from models import get_db_instance
 
+
+def write_log(msg: str) -> None:
+    """Alias for logger.info – used in this module for status messages."""
+    logger.info(msg)
+
 # Exportverzeichnis definieren (relativ zum Projekt)
 EXPORT_DIR = os.path.join(PROJECT_DIR, "exports")
 

@@ -239,6 +239,29 @@ def execute_scan(scan_config):
                     logger.warning(f"[Scheduled Scan] Scan beendet mit Exit-Code {result.returncode}: {log_info_path}")
                 else:
                     logger.info(f"[Scheduled Scan] Scan erfolgreich abgeschlossen: {log_info_path}")
+
+                # Windows-seitiger, read-only Health-Probe direkt nach dem Full-Rebuild,
+                # BEVOR Watchdog-FSHandler wieder schreiben duerfen. Dadurch sehen wir
+                # morgen eindeutig, ob die frisch gebaute WAL-DB schon defekt ist oder
+                # erst nach Watchdog/GUI/Search-Zugriffen kippt.
+                if scan_type == 'full':
+                    probe_script = os.path.join(PROJECT_DIR, 'db_health_probe.py')
+                    if os.path.exists(probe_script):
+                        probe_cmd = [
+                            python_exe,
+                            probe_script,
+                            '--quick-check',
+                            '--limit', '20',
+                            '--max-sql-seconds', '180',
+                        ]
+                        logger.info('[Scheduled Scan] Starte post-rebuild DB-Health-Probe (read-only, Watchdog noch pausiert).')
+                        probe_result = subprocess.run(probe_cmd, stdout=f_out, stderr=f_err)
+                        if probe_result.returncode == 0:
+                            logger.info('[Scheduled Scan] Post-rebuild DB-Health-Probe erfolgreich.')
+                        else:
+                            logger.warning(f"[Scheduled Scan] Post-rebuild DB-Health-Probe beendet mit Exit-Code {probe_result.returncode}.")
+                    else:
+                        logger.warning(f"[Scheduled Scan] DB-Health-Probe nicht gefunden: {probe_script}")
         finally:
             # Immer wieder freigeben, auch bei Fehler oder Ausnahme
             resume_fs_writes()
