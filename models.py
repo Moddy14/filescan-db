@@ -840,6 +840,37 @@ class DBManager:
         except Exception:
             return False
 
+    def read_query(self, sql, params=()):
+        """Führt eine reine Lese-Abfrage aus und gibt fetchall() zurück.
+
+        Für Datei-DBs wird eine SEPARATE read-only Connection verwendet, damit
+        Lesezugriffe (GUI, Reports) nicht vom Schreib-Lock der Haupt-Connection
+        blockiert werden – SQLite WAL erlaubt einen Writer und beliebig viele
+        Reader gleichzeitig. Für ':memory:' (Tests) wird die Haupt-Connection
+        mit eigenem Cursor genutzt, da es dort keinen separaten Pfad gibt.
+        """
+        if self.path == ":memory:":
+            with _db_lock:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(sql, params)
+                    return cur.fetchall()
+                finally:
+                    cur.close()
+
+        conn = sqlite3.connect(
+            "file:" + self.path.replace("\\", "/") + "?mode=ro",
+            uri=True,
+            timeout=30.0,
+        )
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            conn.close()
+
 def get_db_instance(path=None):
     """Gibt eine globale, thread-sichere Singleton-Instanz des DBManagers zurück."""
     global _db_instance, _db_path

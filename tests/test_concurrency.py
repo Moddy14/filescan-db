@@ -61,3 +61,37 @@ class TestConcurrentAccess:
         assert len(set(ids)) == 1, f"alle Threads müssen dieselbe drive_id sehen: {ids}"
         db.cursor.execute("SELECT COUNT(*) FROM drives WHERE name = 'Z:/'")
         assert db.cursor.fetchone()[0] == 1, "kein Duplikat-Laufwerk"
+
+
+class TestReadQuery:
+
+    def test_read_query_memory(self, in_memory_db):
+        db = in_memory_db
+        db.get_or_create_drive("C:/")
+        rows = db.read_query("SELECT name FROM drives")
+        assert ("C:/",) in rows
+
+    def test_read_query_not_blocked_by_open_write(self, tmp_path):
+        """Auf einer Datei-DB (WAL) darf read_query NICHT vom offenen
+        Schreib-Lock der Haupt-Connection blockiert werden – Reads laufen
+        über eine separate read-only Connection parallel zu einem Writer."""
+        from models import DBManager
+
+        db = DBManager(str(tmp_path / "concurrency.db"))
+        try:
+            drive = db.get_or_create_drive("C:/")
+            d = db.get_or_create_directory(drive, "C:/data")
+            db.batch_insert_files([(d, "a.txt", 1, None)])
+            db.conn.commit()
+
+            # Offene Schreib-Transaktion (haelt den Writer-Lock)
+            db.conn.execute("BEGIN IMMEDIATE")
+            db.conn.execute("INSERT INTO drives (name) VALUES ('D:/')")
+            try:
+                # Separate read-only Connection -> darf trotz offenem Write lesen
+                rows = db.read_query("SELECT COUNT(*) FROM files")
+                assert rows[0][0] == 1, "Reader sieht den committeten Snapshot"
+            finally:
+                db.conn.rollback()
+        finally:
+            db.conn.close()
