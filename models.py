@@ -840,6 +840,28 @@ class DBManager:
         except Exception:
             return False
 
+    @with_lock
+    def cleanup_scan_lock_history(self, keep_recent=20):
+        """Entfernt alte, INAKTIVE scan_lock-Einträge (Audit-Bloat).
+
+        Behält alle aktiven Locks sowie die ``keep_recent`` neuesten inaktiven
+        Einträge. Gibt die Anzahl gelöschter Einträge zurück.
+        """
+        self.cursor.execute(
+            """
+            DELETE FROM scan_lock
+            WHERE is_active = 0
+              AND id NOT IN (
+                  SELECT id FROM scan_lock WHERE is_active = 0
+                  ORDER BY id DESC LIMIT ?
+              )
+            """,
+            (keep_recent,),
+        )
+        removed = self.cursor.rowcount
+        self.conn.commit()
+        return removed
+
     def read_query(self, sql, params=()):
         """Führt eine reine Lese-Abfrage aus und gibt fetchall() zurück.
 
