@@ -32,3 +32,34 @@ def test_no_state_line_returns_unknown():
 
 def test_empty_output_returns_unknown():
     assert parse_service_state("") == "UNKNOWN"
+
+
+from gui_services import parse_integrity_line
+
+
+class TestParseIntegrityLine:
+
+    def test_phase(self):
+        assert parse_integrity_line("@@PHASE:dirs") == {"kind": "phase", "phase": "dirs"}
+
+    def test_progress(self):
+        r = parse_integrity_line("@@PROGRESS:50:200")
+        assert r == {"kind": "progress", "current": 50, "total": 200, "pct": 25}
+
+    def test_progress_zero_total(self):
+        r = parse_integrity_line("@@PROGRESS:0:0")
+        assert r["kind"] == "progress" and r["pct"] == 0
+
+    def test_result_valid_json(self):
+        r = parse_integrity_line('@@RESULT:{"missing_files": 3}')
+        assert r["kind"] == "result" and r["data"]["missing_files"] == 3
+
+    def test_result_invalid_json(self):
+        r = parse_integrity_line("@@RESULT:not-json")
+        assert r["kind"] == "result_error"
+
+    def test_plain_log_line(self):
+        assert parse_integrity_line("irgendeine Meldung") == {"kind": "log", "text": "irgendeine Meldung"}
+
+    def test_empty_line(self):
+        assert parse_integrity_line("   ") == {"kind": "empty"}

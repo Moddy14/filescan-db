@@ -864,40 +864,24 @@ class MainWindow(QMainWindow):
         text = bytes(raw).decode('utf-8', errors='replace')
 
         for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            if line.startswith("@@PHASE:"):
-                phase = line[8:]
-                if phase == "dirs":
+            parsed = gui_services.parse_integrity_line(line)
+            kind = parsed["kind"]
+            if kind == "phase":
+                if parsed["phase"] == "dirs":
                     self.log_display.append("[Integritätsprüfung] Phase: Verzeichnisse prüfen...")
-                elif phase == "files":
+                elif parsed["phase"] == "files":
                     self.log_display.append("[Integritätsprüfung] Phase: Dateien prüfen...")
-
-            elif line.startswith("@@PROGRESS:"):
-                parts = line[11:].split(":")
-                if len(parts) == 2:
-                    try:
-                        current = int(parts[0])
-                        total = int(parts[1])
-                        if total > 0:
-                            pct = int(current / total * 100)
-                            # Aktualisiere letzte Zeile im Log mit Fortschritt
-                            self.log_display.append(f"  Fortschritt: {current:,}/{total:,} ({pct}%)")
-                    except ValueError:
-                        pass
-
-            elif line.startswith("@@RESULT:"):
-                json_str = line[9:]
-                try:
-                    self._integrity_result = json.loads(json_str)
-                except (json.JSONDecodeError, ValueError):
-                    logger.warning(f"[GUI] Konnte Integritäts-Ergebnis nicht parsen: {json_str}")
-
-            else:
-                # Normale Log-Ausgabe
-                self.log_display.append(line)
+            elif kind == "progress":
+                self.log_display.append(
+                    f"  Fortschritt: {parsed['current']:,}/{parsed['total']:,} ({parsed['pct']}%)"
+                )
+            elif kind == "result":
+                self._integrity_result = parsed["data"]
+            elif kind == "result_error":
+                logger.warning(f"[GUI] Konnte Integritäts-Ergebnis nicht parsen: {parsed['raw']}")
+            elif kind == "log":
+                self.log_display.append(parsed["text"])
+            # 'empty' -> überspringen
 
         # Auto-Scroll
         self.log_display.moveCursor(QtGui.QTextCursor.End)
