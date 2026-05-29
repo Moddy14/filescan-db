@@ -15,6 +15,21 @@ CONFIG_PATH = os.path.join(PROJECT_DIR, 'config.json') # Config Path als Konstan
 # Globaler Logger wird später initialisiert
 logger = None
 
+# Standard-Konfiguration als Modul-Konstante. WICHTIG: muss auf Modulebene
+# stehen, damit auch der Modul-Level-Init-Code unten (Fehlerbehandlung bei
+# fehlender/korrupter config.json) darauf zugreifen kann – andernfalls
+# NameError beim Import und die gesamte App startet nicht.
+DEFAULT_CONFIG = {
+    "base_path": None,
+    "log_level": "INFO",
+    "hashing": False,
+    "hash_directories": [],
+    "resume_scan": True,
+    "scheduled_scans": [],
+    "watchdog_auto_paths": []
+}
+
+
 def calculate_hash(filepath):
     """Berechnet den SHA256-Hash einer Datei. Gibt None bei Fehlern zurück."""
     try:
@@ -38,16 +53,7 @@ def calculate_hash(filepath):
 
 def load_config():
     """Lädt die Konfiguration aus config.json."""
-    # DEFAULT_CONFIG wie zuvor
-    DEFAULT_CONFIG = {
-        "base_path": None,
-        "log_level": "INFO",
-        "hashing": False,
-        "hash_directories": [],
-        "resume_scan": True,
-        "scheduled_scans": [],
-        "watchdog_auto_paths": []
-    }
+    # Verwendet die Modul-Konstante DEFAULT_CONFIG (siehe oben).
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             config = json.load(f)

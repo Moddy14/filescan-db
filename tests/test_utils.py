@@ -122,6 +122,26 @@ class TestConfig:
 # Test: get_available_drives
 # ---------------------------------------------------------------------------
 
+class TestDefaultConfig:
+    """Regression: DEFAULT_CONFIG muss auf Modulebene existieren, sonst wirft
+    der Modul-Level-Init in utils.py einen NameError, wenn config.json fehlt
+    oder korrupt ist (die gesamte App liesse sich dann nicht mehr starten)."""
+
+    def test_default_config_is_module_level(self):
+        import utils
+        assert isinstance(utils.DEFAULT_CONFIG, dict)
+        assert "log_level" in utils.DEFAULT_CONFIG
+        assert utils.DEFAULT_CONFIG["hashing"] is False
+
+    def test_load_config_uses_defaults_for_missing(self, monkeypatch, tmp_path):
+        import utils as _utils
+        from utils import load_config
+        monkeypatch.setattr(_utils, "CONFIG_PATH", str(tmp_path / "missing.json"))
+        cfg = load_config()
+        for key in _utils.DEFAULT_CONFIG:
+            assert key in cfg
+
+
 class TestGetAvailableDrives:
 
     def test_returns_list(self):
