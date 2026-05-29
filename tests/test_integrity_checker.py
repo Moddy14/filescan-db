@@ -72,3 +72,43 @@ class TestCheckIntegrity:
         """check_integrity auf leerer DB darf nicht crashen."""
         import integrity_checker
         integrity_checker.check_integrity(in_memory_db)  # darf nicht werfen
+
+    def test_multidot_and_same_stem_files_not_falsely_removed(self, in_memory_db, tmp_path):
+        """Regression: nach der Endungs-Haertung darf der Integritaets-Check
+        Mehrpunkt-Dateien ([none]) und gleichnamige Dateien mit verschiedener
+        Endung NICHT faelschlich als 'fehlend' aus der DB loeschen (Pfad-
+        Rekonstruktion full_path/filename(+ext) muss exakt zum Basename passen)."""
+        db = in_memory_db
+        drive = db.get_or_create_drive(_drive_of(tmp_path))
+        d = tmp_path / "mix"
+        d.mkdir()
+        # reale Dateien auf der Platte
+        (d / "backup.2026").write_text("x", encoding="utf-8")          # -> filename='backup.2026', ext='[none]'
+        (d / "logo.png").write_bytes(b"a")                              # -> 'logo' + '.png'
+        (d / "logo.svg").write_bytes(b"bb")                             # -> 'logo' + '.svg'
+        (d / "data.1776402205").write_text("y", encoding="utf-8")       # -> '[none]'
+
+        dir_id = db.get_or_create_directory(drive, str(d))
+        db.batch_insert_files([
+            (dir_id, "backup.2026", 1, None),
+            (dir_id, "logo.png", 1, None),
+            (dir_id, "logo.svg", 2, None),
+            (dir_id, "data.1776402205", 1, None),
+        ])
+        db.conn.commit()
+
+        before = db.cursor.execute(
+            "SELECT COUNT(*) FROM files WHERE directory_id = ?", (dir_id,)
+        ).fetchone()[0]
+        assert before == 4, f"Setup: 4 Dateien erwartet, {before}"
+
+        import integrity_checker
+        integrity_checker.check_integrity(db)
+
+        after = db.cursor.execute(
+            "SELECT COUNT(*) FROM files WHERE directory_id = ?", (dir_id,)
+        ).fetchone()[0]
+        assert after == 4, (
+            f"Integritaets-Check hat real existierende Dateien faelschlich entfernt: "
+            f"{before} -> {after} (Pfad-Rekonstruktion fehlerhaft)"
+        )

@@ -144,6 +144,31 @@ class TestExporterHelpers:
         assert any("Makefile" in p for p in paths)
         assert not any("[none]" in p for p in paths), "kein [none]-Suffix im Export-Pfad"
 
+    def test_export_multidot_and_same_stem_paths(self, tmp_path, in_memory_db):
+        """Mehrpunkt-Namen (ext='[none]') behalten den vollen Namen, gleichnamige
+        Dateien mit verschiedener Endung erscheinen als getrennte, korrekte Pfade."""
+        import json
+        import exporter
+        db = in_memory_db
+        drive_id = db.get_or_create_drive("C:/")
+        dir_id = db.get_or_create_directory(drive_id, "C:/mix")
+        db.batch_insert_files([
+            (dir_id, "logo.png", 1, None),
+            (dir_id, "logo.svg", 2, None),
+            (dir_id, "backup.2026", 3, None),   # -> filename='backup.2026', ext='[none]'
+        ])
+        db.conn.commit()
+
+        out = str(tmp_path / "mix.json")
+        exporter.export_json(exporter.fetch_file_data(db.cursor), out)
+        paths = [r["file_path"] for r in json.load(open(out, encoding="utf-8"))]
+
+        assert any(p.endswith("logo.png") for p in paths)
+        assert any(p.endswith("logo.svg") for p in paths)
+        assert any(p.endswith("backup.2026") for p in paths), "voller Mehrpunkt-Name muss erhalten bleiben"
+        assert not any("[none]" in p for p in paths)
+        assert len(paths) == 3, f"alle drei Dateien muessen exportiert werden, {len(paths)}"
+
     def test_export_all_produces_files(self, tmp_path, monkeypatch, sample_cursor):
         """export_all() must write at least one file per enabled format.
 
