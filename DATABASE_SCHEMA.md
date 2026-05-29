@@ -1,306 +1,196 @@
-# DateiScanner - Vollständige Datenbankbeschreibung
+# DateiScanner – Datenbankschema
+
+> **Maßgeblich ist `models.py` (`DBManager.ensure_schema`).** Dieses Dokument
+> beschreibt das tatsächlich erzeugte, normalisierte Schema (Stand 2026-05-29).
+> Frühere Fassungen dieses Dokuments beschrieben ein veraltetes Schema
+> (`directories.path`, `files.file_path`) – das ist nicht mehr aktuell.
 
 ## Übersicht
 
-Die DateiScanner-Anwendung verwendet eine SQLite-Datenbank (`Dateien.db`) mit **8 Tabellen** zur Verwaltung von Dateisystem-Informationen, Scan-Fortschritt und Lösch-Historie.
-
-**Aktuelle Datensätze:** 4,6 Millionen Dateien und Verzeichnisse über 12 Laufwerke
+SQLite-Datenbank (`Dateien.db`, WAL-Modus) mit **9 Tabellen** und **1 View** zur
+Verwaltung von Dateisystem-Metadaten, Scan-Fortschritt und Lösch-Historie.
+Aktuelle Datenmengen lassen sich jederzeit über `db_health_probe.py` ermitteln.
 
 ---
 
-## Tabellen-Schema
+## Tabellen
 
-### 1. **drives** - Laufwerksverwaltung
-Zentrale Tabelle für alle überwachten Laufwerke.
-
+### 1. `drives` – Laufwerke
 ```sql
 CREATE TABLE drives (
-    id INTEGER PRIMARY KEY,
-    name TEXT UNIQUE NOT NULL
+    id   INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL        -- z. B. 'C:/', 'D:/'
 );
 ```
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `name`: Eindeutiger Laufwerksname (z.B. "C:/", "D:/")
+### 2. `extensions` – Dateiendungen mit Kategorisierung
+```sql
+CREATE TABLE extensions (
+    id        INTEGER PRIMARY KEY,
+    name      TEXT UNIQUE NOT NULL,  -- '.txt', '.pdf', ... bzw. '[none]'
+    category  TEXT,                  -- 'document' | 'image' | 'video' | 'audio'
+                                     -- 'archive' | 'executable' | 'code' | 'other'
+    is_binary BOOLEAN DEFAULT 0,
+    mime_type TEXT
+);
+```
+Wird beim Schema-Aufbau mit Standard-Endungen vorbefüllt
+(`_populate_standard_extensions`). Dateien ohne Endung verwenden `'[none]'`.
 
-**Constraints:**
-- `UNIQUE(name)`: Jedes Laufwerk nur einmal
-- `sqlite_autoindex_drives_1`: Automatischer Index auf name
-
-**Aktuelle Daten:** 12 Laufwerke (D:/, T:/, M:/, etc.)
-
----
-
-### 2. **directories** - Verzeichnisstruktur
-Hierarchische Verzeichnisstruktur pro Laufwerk.
-
+### 3. `directories` – Verzeichnisbaum (hierarchisch)
 ```sql
 CREATE TABLE directories (
-    id INTEGER PRIMARY KEY,
-    drive_id INTEGER NOT NULL,
-    path TEXT NOT NULL,
-    FOREIGN KEY (drive_id) REFERENCES drives (id) ON DELETE CASCADE,
-    UNIQUE (drive_id, path)
+    id             INTEGER PRIMARY KEY,
+    drive_id       INTEGER NOT NULL,
+    parent_id      INTEGER,              -- Hierarchie (self-reference)
+    directory_name TEXT NOT NULL,        -- nur der Name, nicht der ganze Pfad
+    full_path      TEXT NOT NULL,        -- vollständiger Pfad (Forward-Slashes)
+    depth_level    INTEGER DEFAULT 0,
+    FOREIGN KEY (drive_id)  REFERENCES drives (id)      ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES directories (id) ON DELETE CASCADE,
+    UNIQUE (drive_id, full_path)
 );
 ```
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `drive_id`: Referenz zu drives.id
-- `path`: Vollständiger Verzeichnispfad
-
-**Constraints:**
-- `FOREIGN KEY`: Referentielle Integrität zu drives mit CASCADE
-- `UNIQUE(drive_id, path)`: Ein Pfad pro Laufwerk nur einmal
-- `idx_directories_drive_path`: Index für Performance
-
-**Aktuelle Daten:** 323.564 Verzeichnisse
-
----
-
-### 3. **files** - Dateiverwaltung
-Alle gescannten Dateien mit Metadaten.
-
+### 4. `files` – Dateien
 ```sql
 CREATE TABLE files (
-    id INTEGER PRIMARY KEY,
-    directory_id INTEGER NOT NULL,
-    file_path TEXT UNIQUE NOT NULL,
-    size INTEGER,
-    hash TEXT,
-    FOREIGN KEY (directory_id) REFERENCES directories (id) ON DELETE CASCADE
+    id            INTEGER PRIMARY KEY,
+    directory_id  INTEGER NOT NULL,
+    filename      TEXT NOT NULL,         -- Dateiname OHNE Endung
+    extension_id  INTEGER,               -- Referenz auf extensions
+    size          INTEGER,
+    hash          TEXT,                  -- SHA256, optional (konfigurierbar)
+    created_date  TEXT,
+    modified_date TEXT,
+    attributes    INTEGER DEFAULT 0,
+    FOREIGN KEY (directory_id) REFERENCES directories (id) ON DELETE CASCADE,
+    FOREIGN KEY (extension_id) REFERENCES extensions  (id)
 );
 ```
+Eindeutigkeit über den UNIQUE-Index `idx_files_directory_filename
+(directory_id, filename)`. Der vollständige Dateipfad ist **nicht** gespeichert,
+sondern wird bei Bedarf aus `directories.full_path + filename + extension`
+rekonstruiert (siehe View `files_legacy`).
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `directory_id`: Referenz zu directories.id
-- `file_path`: Eindeutiger vollständiger Dateipfad
-- `size`: Dateigröße in Bytes (optional)
-- `hash`: SHA256-Hash (optional, konfigurierbar)
-
-**Constraints:**
-- `FOREIGN KEY`: Referentielle Integrität zu directories mit CASCADE
-- `UNIQUE(file_path)`: Jeder Dateipfad systemweit eindeutig
-- `idx_files_filepath`: Index auf file_path für Suchen
-- `idx_files_directory_id`: Index auf directory_id für Joins
-
-**Aktuelle Daten:** 3.118.873 Dateien
-
----
-
-### 4. **scan_progress** - Scan-Fortschrittsverfolgung
-Speichert Fortsetzungspunkte für unterbrochene Scans.
-
+### 5. `scan_progress` – Fortsetzungspunkte
 ```sql
 CREATE TABLE scan_progress (
-    id INTEGER PRIMARY KEY,
-    drive_id INTEGER UNIQUE NOT NULL,
+    id        INTEGER PRIMARY KEY,
+    drive_id  INTEGER UNIQUE NOT NULL,
     last_path TEXT,
     timestamp TEXT,
     FOREIGN KEY (drive_id) REFERENCES drives (id) ON DELETE CASCADE
 );
 ```
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `drive_id`: Eindeutige Referenz zu drives.id
-- `last_path`: Letzter gescannter Pfad (für Resume-Funktion)
-- `timestamp`: ISO-Format Zeitstempel
-
-**Constraints:**
-- `UNIQUE(drive_id)`: Ein Fortschrittseintrag pro Laufwerk
-- `FOREIGN KEY`: Referentielle Integrität mit CASCADE
-
-**Aktuelle Daten:** 12 Einträge (ein pro Laufwerk)
-
----
-
-### 5. **scan_lock** - Scan-Koordination
-Verhindert gleichzeitige Scans und verfolgt aktive Prozesse.
-
+### 6. `scan_lock` – Scan-Koordination (Mutex)
 ```sql
 CREATE TABLE scan_lock (
-    id INTEGER PRIMARY KEY,
-    scan_type TEXT NOT NULL,
+    id         INTEGER PRIMARY KEY,
+    scan_type  TEXT NOT NULL,           -- 'manual' | 'scheduled' | ...
     start_time TEXT NOT NULL,
-    pid INTEGER NOT NULL,
-    hostname TEXT NOT NULL,
-    is_active INTEGER NOT NULL DEFAULT 1
+    pid        INTEGER NOT NULL,
+    hostname   TEXT NOT NULL,
+    is_active  INTEGER NOT NULL DEFAULT 1
 );
 ```
+Dead-Lock-Erkennung über PID-/Hostname-Validierung (`acquire_scan_lock`).
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `scan_type`: Typ des Scans ("manual", "scheduled", etc.)
-- `start_time`: ISO-Format Startzeitpunkt
-- `pid`: Prozess-ID des Scanners
-- `hostname`: Computer-Name
-- `is_active`: Boolean (1=aktiv, 0=beendet)
-
-**Verwendung:**
-- Mutex-Mechanismus für Scanner
-- Dead-Lock Detection über PID-Prüfung
-- Multi-Host Support
-
-**Aktuelle Daten:** 39 historische Lock-Einträge
-
----
-
-### 6. **export_log** - Export-Protokoll
-Protokolliert alle Datenexporte.
-
+### 7. `export_log` – Export-Protokoll
 ```sql
 CREATE TABLE export_log (
-    id INTEGER PRIMARY KEY,
-    export_type TEXT,
+    id          INTEGER PRIMARY KEY,
+    export_type TEXT,                   -- 'CSV' | 'JSON' | 'HTML'
     export_time TEXT,
-    file_path TEXT
+    file_path   TEXT
 );
 ```
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `export_type`: Format-Typ ("CSV", "JSON", "HTML")
-- `export_time`: ISO-Format Zeitstempel
-- `file_path`: Pfad der generierten Export-Datei
-
-**Aktuelle Daten:** 0 Einträge (noch keine Exporte)
-
----
-
-### 7. **deleted_directories** - Lösch-Historie Verzeichnisse
-Auditlog für gelöschte Verzeichnisse.
-
+### 8. `deleted_directories` – Audit-Trail gelöschter Verzeichnisse
 ```sql
 CREATE TABLE deleted_directories (
-    id INTEGER PRIMARY KEY,
-    drive_id INTEGER,
-    path TEXT NOT NULL,
+    id           INTEGER PRIMARY KEY,
+    drive_id     INTEGER,
+    full_path    TEXT NOT NULL,
     deleted_date TEXT NOT NULL
 );
 ```
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `drive_id`: Ursprüngliche Laufwerks-ID (optional)
-- `path`: Vollständiger Pfad des gelöschten Verzeichnisses
-- `deleted_date`: ISO-Format Löschzeitpunkt
-
-**Zweck:**
-- Audit-Trail für Integritätsprüfungen
-- Recovery-Informationen
-- Cleanup-Historie
-
-**Aktuelle Daten:** 360.731 gelöschte Verzeichnisse
+### 9. `deleted_files` – Audit-Trail gelöschter Dateien
+```sql
+CREATE TABLE deleted_files (
+    id           INTEGER PRIMARY KEY,
+    directory_id INTEGER,
+    filename     TEXT NOT NULL,
+    extension_id INTEGER,
+    deleted_date TEXT NOT NULL
+);
+```
 
 ---
 
-### 8. **deleted_files** - Lösch-Historie Dateien
-Auditlog für gelöschte Dateien.
+## View
 
+### `files_legacy` – Kompatibilitäts-View (rekonstruierter Pfad)
 ```sql
-CREATE TABLE deleted_files (
-    id INTEGER PRIMARY KEY,
-    file_path TEXT NOT NULL,
-    deleted_date TEXT NOT NULL
-);
+CREATE VIEW files_legacy AS
+SELECT f.id,
+       f.directory_id,
+       d.full_path || '/' || f.filename || COALESCE(e.name, '') AS file_path,
+       f.size,
+       f.hash
+FROM files f
+JOIN directories d ON f.directory_id = d.id
+LEFT JOIN extensions e ON f.extension_id = e.id;
 ```
+> ⚠️ Hinweis: Für Dateien ohne Endung hängt die View das Platzhalter-Token
+> `'[none]'` an den Pfad an. Code, der echte Pfade benötigt (z. B.
+> `cleanup_removed_files`), behandelt `'[none]'` daher gesondert.
 
-**Spalten:**
-- `id`: Auto-increment Primary Key
-- `file_path`: Vollständiger Pfad der gelöschten Datei
-- `deleted_date`: ISO-Format Löschzeitpunkt
+---
 
-**Zweck:**
-- Vollständige Lösch-Historie
-- Forensische Analyse
-- Recovery-Support
+## Indizes (`ensure_schema`)
 
-**Aktuelle Daten:** 1.168.850 gelöschte Dateien
+| Index | Spalten | Zweck |
+|-------|---------|-------|
+| `idx_directories_drive_path`      | `(drive_id, full_path)`            | Verzeichnis-Lookup |
+| `idx_directories_parent`          | `(parent_id)`                      | Hierarchie-Traversal |
+| `idx_files_filename`              | `(filename)`                       | Namenssuche |
+| `idx_files_extension`             | `(extension_id)`                   | Filter nach Typ |
+| `idx_files_directory`             | `(directory_id)`                   | Join files↔directories |
+| `idx_files_size`                  | `(size)`                           | Größen-Sortierung/-Filter |
+| `idx_extensions_name` *(UNIQUE)*  | `(name)`                           | Extension-Lookup |
+| `idx_files_directory_filename` *(UNIQUE)* | `(directory_id, filename)` | Eindeutigkeit / Upsert |
+| `idx_files_hash`                  | `(hash)`                           | Duplikat-Erkennung |
+| `idx_extensions_category`         | `(category)`                       | Kategorie-Filter |
+| `idx_files_name_ext_size`         | `(filename, extension_id, size)`   | Duplikat-Heuristik |
 
 ---
 
 ## Referentielle Integrität
 
-### CASCADE-Beziehungen:
 ```
-drives (id) 
-├── directories (drive_id) → ON DELETE CASCADE
-│   └── files (directory_id) → ON DELETE CASCADE
-└── scan_progress (drive_id) → ON DELETE CASCADE
+drives (id)
+├── directories (drive_id)        → ON DELETE CASCADE
+│   ├── directories (parent_id)   → ON DELETE CASCADE (self-reference)
+│   └── files (directory_id)      → ON DELETE CASCADE
+└── scan_progress (drive_id)      → ON DELETE CASCADE
+
+files (extension_id) → extensions (id)   [kein CASCADE]
 ```
 
-**Bedeutung:**
-- Löschen eines Laufwerks → Alle Verzeichnisse und Dateien werden gelöscht
-- Löschen eines Verzeichnisses → Alle Dateien darin werden gelöscht
-- Automatische Konsistenz ohne Waisen-Datensätze
+`PRAGMA foreign_keys = ON` wird in `DBManager.__init__` gesetzt; CASCADE-Deletes
+sind damit aktiv.
 
 ---
 
-## Performance-Optimierungen
+## SQLite-Konfiguration
 
-### Indizes:
-- **drives**: Automatischer Index auf `name` (UNIQUE)
-- **directories**: 
-  - `idx_directories_drive_path` (drive_id, path)
-  - Automatischer UNIQUE-Index
-- **files**:
-  - `idx_files_filepath` (file_path) - für Suchen
-  - `idx_files_directory_id` (directory_id) - für Joins
-  - Automatischer UNIQUE-Index
-- **scan_progress**: Automatischer UNIQUE-Index auf `drive_id`
+- **WAL-Modus** (`PRAGMA journal_mode = WAL`) für bessere Nebenläufigkeit
+- **`busy_timeout = 60000`** (60 s) gegen `database is locked`
+- **Thread-Sicherheit** über `threading.RLock()` (globaler `_db_lock`)
+- **Singleton-DBManager** (`get_db_instance`) mit einer geteilten Verbindung
+- **Batch-Inserts** mit In-Memory-`FileCache` zur Reduktion von DB-Lookups
 
-### SQLite-Optimierungen:
-- **WAL-Modus**: Write-Ahead Logging für bessere Concurrency
-- **Batch-Inserts**: 1000 Dateien pro Transaction
-- **Thread-Safe**: RLock-Mechanismus für Multi-Threading
-- **Connection Pooling**: Singleton-Pattern mit globaler DB-Instanz
-
----
-
-## Datenkonsistenz
-
-### Trigger-System:
-Die Anwendung nutzt vermutlich Trigger für:
-- Automatisches Befüllen von `deleted_directories` bei DELETE auf `directories`
-- Automatisches Befüllen von `deleted_files` bei DELETE auf `files`
-- Zeitstempel-Verwaltung
-
-### Transaktionale Sicherheit:
-- Alle kritischen Operationen in Transaktionen
-- Rollback bei Fehlern
-- Isolation Level für Concurrency
-
----
-
-## Speicherverbrauch
-
-**Geschätzte Datenbankgröße:** ~500MB - 2GB (abhängig von Hash-Berechnung)
-
-**Verteilung:**
-- **files**: ~80% (3,1M Datensätze + Hashes)
-- **directories**: ~15% (323k Datensätze)
-- **deleted_files**: ~4% (1,2M historische Einträge)
-- **deleted_directories**: ~1% (361k historische Einträge)
-- **Sonstige**: <1%
-
----
-
-## Wartung & Monitoring
-
-### Automatische Bereinigung:
-- Integritätsprüfer entfernt nicht-existente Dateien/Verzeichnisse
-- Alte `scan_lock` Einträge werden bei Restart bereinigt
-- Dead-PID Detection für verwaiste Locks
-
-### Überwachung:
-- Watchdog-Service für Echtzeit-Updates
-- Scan-Progress für Resume-Funktionalität
-- Export-Log für Audit-Zwecke
-
----
-
-*Letzte Aktualisierung: $(Get-Date)*
-*Datenbasis: SQLite 3.x mit Python sqlite3-Modul*
+*Letzte Aktualisierung: 2026-05-29 – abgeglichen mit `models.py`.*

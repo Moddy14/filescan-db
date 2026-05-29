@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sqlite3
 import threading
@@ -624,17 +625,54 @@ class DBManager:
 
     @with_lock
     def cleanup_removed_dirs(self, drive_id, scanned_paths_set):
-        self.cursor.execute("SELECT id, path FROM directories WHERE drive_id = ?", (drive_id,))
-        for dir_id, path in self.cursor.fetchall():
-            if path not in scanned_paths_set and not os.path.exists(path):
-                self.cursor.execute("DELETE FROM directories WHERE id = ?", (dir_id,))
+        """Entfernt Verzeichnisse dieses Laufwerks, die weder im frisch
+        gescannten Set enthalten sind NOCH auf dem Dateisystem existieren.
+
+        Hinweis: Spalte ist im aktuellen Schema 'full_path' (nicht 'path').
+        Die zu löschenden IDs werden zuerst vollständig ermittelt und erst
+        danach gelöscht, um Iteration und Mutation desselben Cursors zu trennen.
+        """
+        self.cursor.execute(
+            "SELECT id, full_path FROM directories WHERE drive_id = ?", (drive_id,)
+        )
+        stale_ids = [
+            dir_id
+            for dir_id, full_path in self.cursor.fetchall()
+            if full_path not in scanned_paths_set and not os.path.exists(full_path)
+        ]
+        for dir_id in stale_ids:
+            self.cursor.execute("DELETE FROM directories WHERE id = ?", (dir_id,))
 
     @with_lock
     def cleanup_removed_files(self, scanned_file_paths_set):
-        self.cursor.execute("SELECT id, file_path FROM files")
-        for file_id, path in self.cursor.fetchall():
-            if path not in scanned_file_paths_set and not os.path.exists(path):
-                self.cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        """Entfernt Dateien, die weder im frisch gescannten Set enthalten sind
+        NOCH auf dem Dateisystem existieren.
+
+        Der vollständige Pfad existiert im aktuellen Schema nicht mehr als
+        Spalte, sondern wird aus directories.full_path + files.filename +
+        Extension rekonstruiert. Die Platzhalter-Extension '[none]' (Dateien
+        ohne Endung) wird dabei NICHT an den Pfad angehängt.
+        """
+        self.cursor.execute(
+            """
+            SELECT f.id,
+                   d.full_path || '/' || f.filename ||
+                   CASE
+                       WHEN e.name IS NULL OR e.name = '[none]' THEN ''
+                       ELSE e.name
+                   END AS file_path
+            FROM files f
+            JOIN directories d ON f.directory_id = d.id
+            LEFT JOIN extensions e ON f.extension_id = e.id
+            """
+        )
+        stale_ids = [
+            file_id
+            for file_id, file_path in self.cursor.fetchall()
+            if file_path not in scanned_file_paths_set and not os.path.exists(file_path)
+        ]
+        for file_id in stale_ids:
+            self.cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
     @with_lock
     def clear_drive_data(self, drive_id):

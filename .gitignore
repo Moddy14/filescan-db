@@ -31,7 +31,7 @@ nul
 config.json
 scheduled_scan_status.json
 
-# Test files and directories
+# Ad-hoc-/Debug-Testskripte (NICHT die echte Suite unter tests/)
 test_*
 *_test.py
 *test.txt
@@ -41,6 +41,12 @@ quick_test.bat
 run_test_inline.bat
 test_scan_dir/
 ScanStatusMonitor/
+
+# Die offizielle Regressions-Testsuite SOLL versioniert werden
+# (hebt die test_*-Regeln oben gezielt fuer tests/ wieder auf).
+!tests/
+!tests/conftest.py
+!tests/test_*.py
 
 # Backup files
 *.zip
