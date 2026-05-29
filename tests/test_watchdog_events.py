@@ -39,6 +39,28 @@ class TestOnCreated:
         assert db.cursor.fetchone()[0] == 1
 
 
+class TestOnModified:
+
+    def test_modified_existing_file_is_indexed(self, handler, tmp_path):
+        db = handler.db
+        f = tmp_path / "data.txt"
+        f.write_text("hello", encoding="utf-8")  # 5 Bytes, existiert physisch
+
+        handler.on_modified(FakeEvent(str(f), False))
+
+        db.cursor.execute("SELECT size FROM files WHERE filename = 'data'")
+        row = db.cursor.fetchone()
+        assert row is not None, "geänderte Datei muss indexiert werden"
+        assert row[0] == 5
+
+    def test_modified_directory_event_is_noop(self, handler):
+        db = handler.db
+        # Verzeichnis-Modify darf keine Datei-Eintraege erzeugen / nicht crashen
+        handler.on_modified(FakeEvent("C:/somedir", True))
+        db.cursor.execute("SELECT COUNT(*) FROM files")
+        assert db.cursor.fetchone()[0] == 0
+
+
 class TestOnDeleted:
 
     def test_delete_directory_removes_entry_and_cascades(self, handler):
