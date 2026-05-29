@@ -229,7 +229,9 @@ class DBManager:
             existing = self.cursor.fetchone()
             if existing and existing[0] and 'extension_id' not in existing[0]:
                 logger.info("[DB] Migriere UNIQUE-Index -> (directory_id, filename, extension_id)")
-                self.cursor.execute("DROP INDEX idx_files_directory_filename")
+                # IF EXISTS: robust, falls ein zweiter parallel startender Prozess
+                # (z.B. Watchdog + Scanner) den Index bereits gedroppt hat.
+                self.cursor.execute("DROP INDEX IF EXISTS idx_files_directory_filename")
 
             indices = [
                 "CREATE INDEX IF NOT EXISTS idx_directories_drive_path ON directories (drive_id, full_path)",
