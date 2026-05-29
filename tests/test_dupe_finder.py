@@ -39,6 +39,45 @@ class TestHashDuplicates:
         assert dupe_finder.find_hash_duplicates(db) == []
 
 
+class TestDuplicateFilesDetailed:
+
+    def test_hash_detail_rows(self, in_memory_db):
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        d1 = db.get_or_create_directory(drive, "C:/A")
+        d2 = db.get_or_create_directory(drive, "C:/B")
+        db.batch_insert_files([
+            (d1, "x.txt", 10, "H1"),
+            (d2, "y.txt", 20, "H1"),   # gleicher Hash -> Gruppe
+            (d1, "z.txt", 5, "H2"),    # einzigartig
+        ])
+        db.conn.commit()
+
+        import dupe_finder
+        rows = dupe_finder.find_duplicate_files(db, method="hash")
+        # (id, full_path, filename, extension, size, hash, dup_count)
+        assert len(rows) == 2
+        assert all(r[5] == "H1" for r in rows)   # hash
+        assert all(r[6] == 2 for r in rows)      # dup_count
+
+    def test_name_size_detail_no_none_suffix(self, in_memory_db):
+        db = in_memory_db
+        drive = db.get_or_create_drive("C:/")
+        d1 = db.get_or_create_directory(drive, "C:/A")
+        d2 = db.get_or_create_directory(drive, "C:/B")
+        db.batch_insert_files([
+            (d1, "Makefile", 100, None),
+            (d2, "Makefile", 100, None),  # gleicher Name+Größe, ohne Extension
+        ])
+        db.conn.commit()
+
+        import dupe_finder
+        rows = dupe_finder.find_duplicate_files(db, method="name_size")
+        assert len(rows) == 2
+        # extension-Spalte (Index 3) darf kein '[none]' sein
+        assert all(r[3] == "" for r in rows)
+
+
 class TestNameSizeDuplicates:
 
     def test_finds_same_name_and_size(self, in_memory_db):
