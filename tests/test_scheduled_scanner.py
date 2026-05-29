@@ -26,6 +26,30 @@ class TestParseTime:
         assert _parse_time("") is None
 
 
+class TestParseTimeRanges:
+    """_parse_time muss ausserhalb gueltiger Bereiche None liefern, sonst crasht
+    should_scan_run_now via datetime.replace(hour=24)."""
+
+    @pytest.mark.parametrize("bad", ["24:00", "12:60", "-1:30", "12:-5", "99:99"])
+    def test_out_of_range_is_none(self, bad):
+        from scheduled_scanner import _parse_time
+        assert _parse_time(bad) is None
+
+    @pytest.mark.parametrize("good,exp", [("00:00", (0, 0)), ("23:59", (23, 59)), ("09:05", (9, 5))])
+    def test_valid_bounds(self, good, exp):
+        from scheduled_scanner import _parse_time
+        assert _parse_time(good) == exp
+
+
+class TestShouldScanRunNowInvalidTime:
+    def test_invalid_time_returns_false_without_crash(self, tmp_path, monkeypatch):
+        import scheduled_scanner as ss
+        monkeypatch.setattr(ss, "_LAST_RUN_FILE", str(tmp_path / "lr.json"))
+        cfg = {"scan_type": "drive", "path": "C:/", "time": "25:00"}
+        # darf NICHT mit ValueError (replace(hour=25)) abstuerzen
+        assert ss.should_scan_run_now(cfg) is False
+
+
 class TestScanKey:
     def test_stable_for_same_config(self):
         from scheduled_scanner import _scan_key

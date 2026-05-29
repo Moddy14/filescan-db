@@ -50,12 +50,20 @@ def _scan_key(scan_config):
 
 
 def _parse_time(time_str):
-    """Parst einen HH:MM-String in (hour, minute). Gibt None bei Fehler zurueck."""
+    """Parst einen HH:MM-String in (hour, minute).
+
+    Gibt None bei Fehler ODER ausserhalb gueltiger Bereiche (0-23 / 0-59) zurueck.
+    Letzteres ist wichtig, weil should_scan_run_now sonst via
+    datetime.replace(hour=24) mit ValueError abstuerzen wuerde.
+    """
     try:
         parts = time_str.split(":")
-        return int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
+        hour, minute = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError, AttributeError, TypeError):
         return None
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour, minute
+    return None
 
 
 def get_scheduled_scans():

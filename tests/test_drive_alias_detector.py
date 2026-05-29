@@ -71,6 +71,36 @@ class TestSubstScenario:
         assert orig == "D:"
 
 
+class TestGetCanonicalDriveList:
+    """Die Funktion, die der Gesamtlauf zur Laufwerksauswahl nutzt: subst-Aliase
+    (z.B. T: -> C:) MUESSEN ausgeschlossen werden, sonst doppelter Scan."""
+
+    def test_excludes_subst_alias_drive(self, monkeypatch):
+        import drive_alias_detector as dad
+        import utils
+        monkeypatch.setattr(utils, "get_available_drives", lambda: ["C:\\", "D:\\", "T:\\"])
+        monkeypatch.setattr(dad, "get_drive_mapping", lambda: {"T:": r"C:\Laufwerk T\USB16GB"})
+        result = dad.get_canonical_drive_list()
+        letters = [d.rstrip("/\\").upper() for d in result]
+        assert "T:" not in letters, "subst-Alias T: darf nicht doppelt gescannt werden"
+        assert "C:" in letters and "D:" in letters
+
+    def test_no_aliases_returns_all(self, monkeypatch):
+        import drive_alias_detector as dad
+        import utils
+        monkeypatch.setattr(utils, "get_available_drives", lambda: ["C:\\", "D:\\"])
+        monkeypatch.setattr(dad, "get_drive_mapping", lambda: {})
+        result = dad.get_canonical_drive_list()
+        assert sorted(d.rstrip("/\\").upper() for d in result) == ["C:", "D:"]
+
+    def test_returns_list(self, monkeypatch):
+        import drive_alias_detector as dad
+        import utils
+        monkeypatch.setattr(utils, "get_available_drives", lambda: [])
+        monkeypatch.setattr(dad, "get_drive_mapping", lambda: {})
+        assert dad.get_canonical_drive_list() == []
+
+
 class TestIsPathAliasOf:
 
     def test_alias_and_real_path_match(self, monkeypatch):
