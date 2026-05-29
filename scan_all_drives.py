@@ -6,7 +6,7 @@ import logging
 
 # Importiere zentrale Funktionen und Konstanten
 try:
-    from utils import logger, setup_logging, PROJECT_DIR, get_available_drives
+    from utils import logger, setup_logging, PROJECT_DIR, get_available_drives, load_config
     from models import get_db_instance
 except ImportError:
     print("FEHLER: utils.py oder models.py nicht gefunden. Stelle sicher, dass das Skript im Hauptverzeichnis des Projekts liegt.")

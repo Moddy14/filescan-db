@@ -12,6 +12,17 @@ import pytest
 from scan_all_drives import classify_scan_exit_code
 
 
+class TestLoadConfigImport:
+    """scan_all_drives.main() ruft load_config() fuer extra_scan_drives auf.
+    War nicht importiert -> NameError (abgefangen, aber extra_scan_drives wurden
+    nie geladen). load_config muss im Modul-Namespace verfuegbar sein."""
+
+    def test_load_config_available(self):
+        import scan_all_drives
+        assert hasattr(scan_all_drives, "load_config"), "load_config muss importiert sein"
+        assert callable(scan_all_drives.load_config)
+
+
 class TestClassifyScanExitCode:
 
     def test_zero_is_success(self):
