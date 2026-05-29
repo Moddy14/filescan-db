@@ -7,6 +7,7 @@ import html  # Für HTML-Export im Exporter-Teil (jetzt hier importiert? Besser 
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QLabel, QListWidget, QPushButton, QFileDialog, QHBoxLayout, QListWidgetItem, QMessageBox, QApplication, QMainWindow, QWidget, QProgressBar, QTreeView, QFileSystemModel, QTextEdit, QDialogButtonBox, QMenu, QAction, QHeaderView, QComboBox, QTableWidget, QTableWidgetItem, QTimeEdit, QAbstractItemView, QInputDialog
 from models import get_db_instance
+import gui_data
 import hashlib
 import json
 from datetime import datetime
@@ -1058,25 +1059,19 @@ class MainWindow(QMainWindow):
         else:
             force_scan = False
         
-        # --- NEU: Prüfe ob Daten existieren und frage nach Scan-Modus ---
-        drive_name = os.path.splitdrive(selected_path)[0] + "/"
-        db.cursor.execute("SELECT id FROM drives WHERE name = ?", (drive_name,))
-        drive_exists = db.cursor.fetchone()
-        
+        # --- Prüfe ob Daten existieren und frage nach Scan-Modus ---
+        # DB-Abfragen ausgelagert nach gui_data (GUI-frei, getestet, cursor-isoliert)
+        drive_name = gui_data.drive_name_from_path(selected_path)
+        overview = gui_data.get_drive_overview(db, drive_name)
+
         use_restart = False  # Standard: kein --restart
-        
-        if drive_exists:
-            drive_id = drive_exists[0]
-            
-            # Prüfe ob Fortsetzungspunkt existiert
-            resume_point = db.get_last_scan_path(drive_id)
-            
-            # Zähle vorhandene Daten
-            db.cursor.execute("SELECT COUNT(*) FROM files f JOIN directories d ON f.directory_id = d.id WHERE d.drive_id = ?", (drive_id,))
-            file_count = db.cursor.fetchone()[0]
-            db.cursor.execute("SELECT COUNT(*) FROM directories WHERE drive_id = ?", (drive_id,))
-            dir_count = db.cursor.fetchone()[0]
-            
+
+        if overview["exists"]:
+            drive_id = overview["drive_id"]
+            resume_point = overview["resume_point"]
+            file_count = overview["file_count"]
+            dir_count = overview["dir_count"]
+
             if file_count > 0 or dir_count > 0:
                 # Erstelle benutzerdefinierten Dialog
                 dialog = QMessageBox(self)
