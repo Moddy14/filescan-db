@@ -163,6 +163,7 @@ class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
 
 class EnhancedSearchWorker(QThread):
     finished = pyqtSignal(list, int, str)  # results, total_count, query_info
+    debug_log = pyqtSignal(str)  # Debug-Nachrichten
 
     def __init__(self, db_path, search_criteria):
         super().__init__()
@@ -171,7 +172,16 @@ class EnhancedSearchWorker(QThread):
 
     def run(self):
         try:
-            conn = sqlite3.connect(self.db_path)
+            import datetime as _dt
+            self.debug_log.emit("=" * 60)
+            self.debug_log.emit(f"🔍 ERWEITERTE SUCHE GESTARTET - {_dt.datetime.now().strftime('%H:%M:%S')}")
+            self.debug_log.emit(f"📂 Datenbank: {self.db_path}")
+            self.debug_log.emit(f"\n📋 SUCHKRITERIEN:")
+            for key, val in self.search_criteria.items():
+                self.debug_log.emit(f"   {key}: {repr(val)}")
+            db_uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=30.0)
+            conn.execute("PRAGMA query_only = ON")
             cursor = conn.cursor()
             
             # Basis-Query für optimierte Datenbankstruktur
@@ -271,6 +281,14 @@ class EnhancedSearchWorker(QThread):
                 query = base_query + " WHERE " + " AND ".join(where_clauses)
             else:
                 query = base_query
+            
+            # DEBUG: WHERE-Klauseln loggen
+            self.debug_log.emit(f"\n📊 SQL WHERE-KLAUSELN ({len(where_clauses)}):")
+            for i, clause in enumerate(where_clauses):
+                self.debug_log.emit(f"   [{i}] {clause.strip()}")
+            self.debug_log.emit(f"\n📊 PARAMETER ({len(params)}):")
+            for i, p in enumerate(params):
+                self.debug_log.emit(f"   [{i}] {repr(p)}")
                 
             # Sortierung hinzufügen
             order_by = self.search_criteria.get('order_by', 'full_file_path')
@@ -281,9 +299,18 @@ class EnhancedSearchWorker(QThread):
             limit = self.search_criteria.get('limit', 10000)
             query += f" LIMIT {limit}"
             
+            # DEBUG: Vollständige Query loggen
+            self.debug_log.emit(f"\n📊 VOLLSTÄNDIGE QUERY:\n{query}")
+            
             # Query ausführen
             cursor.execute(query, params)
             results = cursor.fetchall()
+            self.debug_log.emit(f"\n✅ {len(results)} Zeilen geladen")
+            # DEBUG: Erste 5 Ergebnisse zeigen
+            for i, row in enumerate(results[:5]):
+                self.debug_log.emit(f"   Zeile {i}: ID={row[0]}, Drive={row[1]}, Pfad={row[2]}, Name={row[3]}, Ext={row[4]}")
+            if len(results) > 5:
+                self.debug_log.emit(f"   ... und {len(results)-5} weitere")
             
             # Zähle Gesamtergebnisse (ohne LIMIT)
             count_query = query.replace(base_query, "SELECT COUNT(*) FROM files JOIN directories ON files.directory_id = directories.id JOIN drives ON directories.drive_id = drives.id LEFT JOIN extensions ON files.extension_id = extensions.id")
@@ -291,15 +318,21 @@ class EnhancedSearchWorker(QThread):
             count_query = count_query.split('LIMIT')[0]
             cursor.execute(count_query, params)
             total_count = cursor.fetchone()[0]
+            self.debug_log.emit(f"🔢 Gesamt (ohne LIMIT): {total_count}")
             
             conn.close()
             
             # Query-Info für Debugging
             query_info = f"Parameters: {params} | Total: {total_count} | Shown: {len(results)}"
             
+            self.debug_log.emit(f"\n🏁 ENDERGEBNIS: {len(results)} Dateien an GUI übergeben")
+            self.debug_log.emit("=" * 60)
+            
             self.finished.emit(results, total_count, query_info)
             
         except Exception as e:
+            self.debug_log.emit(f"\n❌ FEHLER: {str(e)}")
+            self.debug_log.emit("=" * 60)
             self.finished.emit([], 0, f"Error: {str(e)}")
 
 class EnhancedMainWindow(QtWidgets.QMainWindow):
@@ -327,7 +360,9 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
 
     def connect_db(self):
         try:
-            self.conn = sqlite3.connect(self.db_path)
+            db_uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
+            self.conn = sqlite3.connect(db_uri, uri=True, timeout=30.0)
+            self.conn.execute("PRAGMA query_only = ON")
         except sqlite3.Error as e:
             QtWidgets.QMessageBox.critical(self, "DB Fehler", f"Fehler beim Verbinden zur DB: {e}")
             sys.exit(1)
@@ -630,6 +665,30 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel("Bereit für erweiterte Suche")
         main_layout.addWidget(self.status_label)
         
+        # --- DEBUG-Panel ---
+        self.debug_group = QtWidgets.QGroupBox("🐛 Debug-Log (SQL-Queries & Filter)")
+        self.debug_group.setCheckable(True)
+        self.debug_group.setChecked(False)  # Standardmäßig zugeklappt
+        debug_layout = QtWidgets.QVBoxLayout()
+        self.debug_text = QtWidgets.QPlainTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setMaximumHeight(250)
+        self.debug_text.setFont(QtGui.QFont("Consolas", 9))
+        self.debug_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc; border: 1px solid #555;")
+        debug_btn_layout = QtWidgets.QHBoxLayout()
+        debug_clear_btn = QtWidgets.QPushButton("🗑️ Log leeren")
+        debug_clear_btn.clicked.connect(self.debug_text.clear)
+        debug_copy_btn = QtWidgets.QPushButton("📋 Log kopieren")
+        debug_copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.debug_text.toPlainText()))
+        debug_btn_layout.addWidget(debug_clear_btn)
+        debug_btn_layout.addWidget(debug_copy_btn)
+        debug_btn_layout.addStretch()
+        debug_layout.addWidget(self.debug_text)
+        debug_layout.addLayout(debug_btn_layout)
+        self.debug_group.setLayout(debug_layout)
+        main_layout.addWidget(self.debug_group)
+        # --- Ende DEBUG-Panel ---
+        
         central_widget.setLayout(main_layout)
 
     def _apply_stylesheet(self):
@@ -844,18 +903,26 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
 
         for term in terms:
             if term['is_first']:
-                sql_parts.append(f"({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                sql_parts.append(
+                    f"({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                )
+                params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
             else:
                 if term['operator'] == 'NOT':
-                    sql_parts.append(f"AND ({full_name_expr} NOT LIKE ? AND files.filename NOT LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"AND ({full_name_expr} NOT LIKE ? AND files.filename NOT LIKE ? AND COALESCE(extensions.name, '') NOT LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 elif term['operator'] == 'OR':
-                    sql_parts.append(f"OR ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"OR ({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
                 else:  # AND
-                    sql_parts.append(f"AND ({full_name_expr} LIKE ? OR files.filename LIKE ?)")
-                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%"])
+                    sql_parts.append(
+                        f"AND ({full_name_expr} LIKE ? OR files.filename LIKE ? OR COALESCE(extensions.name, '') LIKE ?)"
+                    )
+                    params.extend([f"%{term['pattern']}%", f"%{term['pattern']}%", f"%{term['pattern']}%"])
         
         if sql_parts:
             # Gesamten Ausdruck in Klammern setzen
@@ -975,7 +1042,12 @@ class EnhancedMainWindow(QtWidgets.QMainWindow):
         
         self.worker = EnhancedSearchWorker(self.db_path, criteria)
         self.worker.finished.connect(self.on_search_finished)
+        self.worker.debug_log.connect(self._append_debug)
         self.worker.start()
+    
+    def _append_debug(self, msg):
+        """Debug-Nachricht ans Log anhängen"""
+        self.debug_text.appendPlainText(msg)
 
     def on_search_finished(self, results, total_count, query_info):
         """Verarbeitet die Suchergebnisse"""

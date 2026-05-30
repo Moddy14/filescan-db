@@ -11,6 +11,11 @@ import logging
 from utils import DB_PATH, CONFIG, PROJECT_DIR, logger
 from models import get_db_instance
 
+
+def write_log(msg: str) -> None:
+    """Alias for logger.info – used in this module for status messages."""
+    logger.info(msg)
+
 # Exportverzeichnis definieren (relativ zum Projekt)
 EXPORT_DIR = os.path.join(PROJECT_DIR, "exports")
 
@@ -33,8 +38,9 @@ def fetch_file_data(db_cursor, path_filter=None):
     """Holt Dateiinformationen aus der Datenbank, optional gefiltert nach Pfad."""
     # Erweiterte Query für optimierte Datenbankstruktur - rekonstruiert vollständigen Pfad
     query = '''
-        SELECT 
-            d.full_path || '/' || f.filename || COALESCE(e.name, '') as file_path,
+        SELECT
+            d.full_path || '/' || f.filename ||
+                CASE WHEN e.name IS NULL OR e.name = '[none]' THEN '' ELSE e.name END as file_path,
             f.size, 
             f.hash, 
             d.full_path AS dir_path, 

@@ -1,4 +1,6 @@
+# -*- coding: utf-8 -*-
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -12,26 +14,76 @@ _db_lock = threading.RLock()
 _db_instance = None
 _db_path = None
 
+# --- Endungs-Plausibilitaet (Root-Cause-Fix gegen extensions-Bloat) ---------
+# os.path.splitext nimmt blind alles nach dem letzten Punkt als "Endung". Bei
+# Dateinamen mit mehreren Punkten (Versionen, Datumsangaben, Hashes, Assembly-
+# Strings) entstand so Muell wie '.0', '.0-STABLE', '.luzia-UBUNTU_2,ST' oder
+# 67-Zeichen-SHA-Hashes – pro eindeutigem String eine permanente extensions-Zeile.
+# R3-Regel: Punkt + alnum-Startzeichen + bis zu 15 weitere [alnum/_/-], und es
+# muss mindestens ein Buchstabe vorkommen (verwirft rein-numerische wie '.0').
+NONE_EXT = '[none]'
+_PLAUSIBLE_EXT_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9_-]{0,15}$")
+
+# scan_lock ist ein Mutex + kurze Verlaufsanzeige, KEIN Audit-Trail. acquire
+# beschneidet die inaktive Historie automatisch auf die letzten N Eintraege,
+# damit nie ein externer Cleanup noetig ist (Root-Cause-Fix gegen scan_lock-Bloat).
+SCAN_LOCK_HISTORY_KEEP = 20
+
+
+def _is_plausible_ext(ext):
+    """True, wenn ``ext`` wie eine echte Datei-Endung aussieht (R3-Regel).
+
+    Case-insensitiv (das Muster akzeptiert beide Schreibweisen). Rein-numerische
+    "Endungen" gelten immer als Muell.
+    """
+    if not ext or ext == NONE_EXT:
+        return False
+    if not _PLAUSIBLE_EXT_RE.match(ext):
+        return False
+    return any(ch.isalpha() for ch in ext)
+
+
+def split_name_ext(basename):
+    """Trennt einen Basename in (filename, ext) mit Plausibilitaets-Pruefung.
+
+    Nur eine plausible Endung (siehe :func:`_is_plausible_ext`) wird abgetrennt;
+    sonst bleibt der VOLLE Name im filename und ext == '[none]'. Gespeichert wird
+    die Originalschreibweise. Es gilt stets die Konkatenations-Invariante::
+
+        filename + (ext, falls echt) == basename
+
+    Diese Invariante ist Voraussetzung fuer die Pfad-Rekonstruktion in
+    integrity_checker.py / exporter.py (full_path/filename/e.name).
+    """
+    stem, ext = os.path.splitext(basename)
+    if _is_plausible_ext(ext):
+        return stem, ext
+    return basename, NONE_EXT
+
 class FileCache:
     """Leichtgewichtiger In-Memory Cache für existierende Dateien"""
     
     def __init__(self):
-        self.cache = {}  # (directory_id, filename) -> True
+        self.cache = {}  # (directory_id, filename, extension_id) -> True
         self.lock = threading.RLock()
         self.enabled = True
         self.max_entries = 100000  # Max 100k Einträge im Cache
-        
-    def check(self, directory_id, filename):
-        """Prüft ob Datei im Cache ist (True = existiert, None = unbekannt)"""
+
+    def check(self, directory_id, filename, extension_id=None):
+        """Prüft ob Datei im Cache ist (True = existiert, None = unbekannt).
+
+        Der Schluessel enthaelt extension_id, damit gleichnamige Dateien mit
+        verschiedener Endung (logo.png / logo.svg) NICHT als dieselbe Datei gelten.
+        """
         if not self.enabled:
             return None
         with self.lock:
-            key = (directory_id, filename)
+            key = (directory_id, filename, extension_id)
             if key in self.cache:
                 return True
             return None  # Unbekannt, nicht False
-    
-    def add(self, directory_id, filename):
+
+    def add(self, directory_id, filename, extension_id=None):
         """Fügt Datei zum Cache hinzu"""
         if not self.enabled:
             return
@@ -42,12 +94,12 @@ class FileCache:
                 to_remove = list(self.cache.keys())[:self.max_entries // 10]
                 for key in to_remove:
                     del self.cache[key]
-            self.cache[(directory_id, filename)] = True
-    
-    def remove(self, directory_id, filename):
+            self.cache[(directory_id, filename, extension_id)] = True
+
+    def remove(self, directory_id, filename, extension_id=None):
         """Entfernt Datei aus Cache"""
         with self.lock:
-            self.cache.pop((directory_id, filename), None)
+            self.cache.pop((directory_id, filename, extension_id), None)
     
     def clear(self):
         """Leert den Cache"""
@@ -83,17 +135,11 @@ class DBManager:
                 logger.error("[DB] KRITISCH: Foreign Keys bleiben deaktiviert!")
         
         self.path = db_path
-        self.lock = threading.Lock()
-        
-        # NEU: File Cache für Performance
-        self.file_cache = FileCache()
-        
-        self.connect()
-        self.ensure_schema()
 
-    def connect(self):
-        # ... (unverändert)
-        pass # Hinzugefügt, um Einrückungsfehler zu beheben
+        # In-Memory File Cache für Performance
+        self.file_cache = FileCache()
+
+        self.ensure_schema()
 
     def with_lock(func):
         def wrapper(self, *args, **kwargs):
@@ -171,6 +217,22 @@ class DBManager:
         
         # 6. Performance-Indizes (nach Tabellenerstellung)
         try:
+            # MIGRATION: Der UNIQUE-Index war frueher nur (directory_id, filename)
+            # OHNE extension_id. Da filename der Name OHNE Endung ist, kollidierten
+            # gleichnamige Dateien mit verschiedener Endung (logo.png vs logo.svg) und
+            # eine Datei ging per INSERT OR IGNORE verloren. Wir ersetzen den alten
+            # Index idempotent durch die 3-spaltige Variante.
+            self.cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_files_directory_filename'"
+            )
+            existing = self.cursor.fetchone()
+            if existing and existing[0] and 'extension_id' not in existing[0]:
+                logger.info("[DB] Migriere UNIQUE-Index -> (directory_id, filename, extension_id)")
+                # IF EXISTS: robust, falls ein zweiter parallel startender Prozess
+                # (z.B. Watchdog + Scanner) den Index bereits gedroppt hat.
+                self.cursor.execute("DROP INDEX IF EXISTS idx_files_directory_filename")
+
             indices = [
                 "CREATE INDEX IF NOT EXISTS idx_directories_drive_path ON directories (drive_id, full_path)",
                 "CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories (parent_id)",
@@ -179,12 +241,12 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_files_directory ON files (directory_id)",
                 "CREATE INDEX IF NOT EXISTS idx_files_size ON files (size)",
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_extensions_name ON extensions (name)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_directory_filename ON files (directory_id, filename, extension_id)",
                 "CREATE INDEX IF NOT EXISTS idx_files_hash ON files (hash)",
                 "CREATE INDEX IF NOT EXISTS idx_extensions_category ON extensions (category)",
                 "CREATE INDEX IF NOT EXISTS idx_files_name_ext_size ON files (filename, extension_id, size)"
             ]
-            
+
             for idx_sql in indices:
                 self.cursor.execute(idx_sql)
         except sqlite3.Error as e:
@@ -256,9 +318,6 @@ class DBManager:
             JOIN directories d ON f.directory_id = d.id
             LEFT JOIN extensions e ON f.extension_id = e.id
         """)
-        
-        # Standard Extensions einfügen
-        self._populate_standard_extensions()
         
         self.conn.commit()
         logger.info("[DB] Optimiertes Datenbankschema erstellt/aktualisiert.")
@@ -355,10 +414,17 @@ class DBManager:
 
     @with_lock
     def get_or_create_extension(self, ext_name):
-        """Holt oder erstellt eine Extension-ID."""
+        """Holt oder erstellt eine Extension-ID.
+
+        Backstop gegen Bloat: unplausible Endungen (splitext-Muell) werden NICHT
+        als neue Zeile angelegt, sondern auf '[none]' abgebildet. So kann auch ein
+        Aufrufer, der split_name_ext nicht nutzt, keine Muell-Extension erzeugen.
+        """
         if not ext_name:
-            ext_name = '[none]'
-        
+            ext_name = NONE_EXT
+        elif ext_name != NONE_EXT and not _is_plausible_ext(ext_name):
+            ext_name = NONE_EXT
+
         self.cursor.execute("SELECT id FROM extensions WHERE name = ?", (ext_name,))
         row = self.cursor.fetchone()
         if row:
@@ -460,66 +526,58 @@ class DBManager:
     @with_lock
     def insert_file_optimized(self, directory_id, full_filename, size, hash_val, created_date=None, modified_date=None):
         """Optimierte Datei-Einfügung mit Cache und UNIQUE INDEX Kompatibilität."""
-        # Filename und Extension trennen
-        filename, ext = os.path.splitext(full_filename)
-        
-        # PERFORMANCE: Prüfe Cache zuerst
-        in_cache = self.file_cache.check(directory_id, filename)
-        
+        # Filename und Extension trennen (mit Plausibilitaets-Pruefung gegen Muell-Endungen)
+        filename, ext = split_name_ext(full_filename)
+
         # Extension-ID ermitteln
-        extension_id = self.get_or_create_extension(ext) if ext else self.get_or_create_extension('[none]')
+        extension_id = self.get_or_create_extension(ext)
+
+        # PERFORMANCE: Prüfe Cache zuerst (Schluessel inkl. extension_id, damit
+        # gleichnamige Dateien mit verschiedener Endung nicht kollidieren)
+        in_cache = self.file_cache.check(directory_id, filename, extension_id)
         
         if in_cache is True:
-            # Definitiv im Cache = UPDATE
+            # Cache sagt: Datei existiert -> UPDATE. Falls die Zeile wider
+            # Erwarten fehlt (Cache-Inkonsistenz), auf INSERT zurückfallen,
+            # damit die Datei nicht verloren geht.
             self.cursor.execute("""
-                UPDATE files 
+                UPDATE files
                 SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                WHERE directory_id = ? AND filename = ?
-            """, (size, hash_val, modified_date, directory_id, filename))
-            return self.cursor.lastrowid
-            
-        elif in_cache is False:
-            # Definitiv NICHT im Cache = INSERT
-            try:
+                WHERE directory_id = ? AND filename = ? AND extension_id IS ?
+            """, (size, hash_val, modified_date, directory_id, filename, extension_id))
+            if self.cursor.rowcount == 0:
                 self.cursor.execute("""
-                    INSERT INTO files 
-                    (directory_id, filename, extension_id, size, hash, created_date, modified_date) 
+                    INSERT OR IGNORE INTO files
+                    (directory_id, filename, extension_id, size, hash, created_date, modified_date)
                     VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                 """, (directory_id, filename, extension_id, size, hash_val, created_date, modified_date))
-                self.file_cache.add(directory_id, filename)
-                return self.cursor.lastrowid
-            except sqlite3.IntegrityError:
-                # Race condition oder Cache miss - UPDATE
-                self.cursor.execute("""
-                    UPDATE files 
-                    SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                    WHERE directory_id = ? AND filename = ?
-                """, (size, hash_val, modified_date, directory_id, filename))
-                self.file_cache.add(directory_id, filename)
-                return self.cursor.lastrowid
-        
+            self.file_cache.add(directory_id, filename, extension_id)
+            return self.cursor.lastrowid
+
         else:
-            # Cache unbekannt (None) = Alte Logik mit DB-Check
+            # Cache unbekannt (None) = DB-Check.
+            # (FileCache.check liefert nur True oder None, nie False – ein
+            #  "definitiv nicht im Cache"-Zweig wäre toter Code.)
             # Versuche erst zu aktualisieren (wenn Datei existiert)
             self.cursor.execute("""
-                UPDATE files 
+                UPDATE files
                 SET size = ?, hash = ?, modified_date = COALESCE(?, datetime('now'))
-                WHERE directory_id = ? AND filename = ?
-            """, (size, hash_val, modified_date, directory_id, filename))
-            
+                WHERE directory_id = ? AND filename = ? AND extension_id IS ?
+            """, (size, hash_val, modified_date, directory_id, filename, extension_id))
+
             if self.cursor.rowcount > 0:
                 # UPDATE erfolgreich = Datei existierte
-                self.file_cache.add(directory_id, filename)
+                self.file_cache.add(directory_id, filename, extension_id)
             else:
                 # Keine Zeile aktualisiert = INSERT nötig
                 self.cursor.execute("""
-                    INSERT OR IGNORE INTO files 
-                    (directory_id, filename, extension_id, size, hash, created_date, modified_date) 
+                    INSERT OR IGNORE INTO files
+                    (directory_id, filename, extension_id, size, hash, created_date, modified_date)
                     VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
                 """, (directory_id, filename, extension_id, size, hash_val, created_date, modified_date))
                 if self.cursor.rowcount > 0:
-                    self.file_cache.add(directory_id, filename)
-            
+                    self.file_cache.add(directory_id, filename, extension_id)
+
             return self.cursor.lastrowid
 
     @with_lock
@@ -536,13 +594,13 @@ class DBManager:
             # Konvertiere zu optimierter Struktur
             optimized_tuples = []
             for dir_id, full_filename, size, hash_val in file_tuples:
-                # Parse filename und extension
+                # Parse filename und extension (mit Plausibilitaets-Pruefung)
                 basename = os.path.basename(full_filename) if '/' in full_filename or '\\' in full_filename else full_filename
-                filename, ext = os.path.splitext(basename)
-                
+                filename, ext = split_name_ext(basename)
+
                 # Extension-ID ermitteln (Bulk-Optimierung möglich)
-                extension_id = self.get_or_create_extension(ext) if ext else self.get_or_create_extension('[none]')
-                
+                extension_id = self.get_or_create_extension(ext)
+
                 optimized_tuples.append((dir_id, filename, extension_id, size, hash_val))
             
             # Batch-Insert in optimierte Tabelle mit Cache-Unterstützung
@@ -550,37 +608,35 @@ class DBManager:
             inserts = []
             
             for dir_id, filename, extension_id, size, hash_val in optimized_tuples:
-                # Prüfe Cache für bessere Performance
-                in_cache = self.file_cache.check(dir_id, filename)
-                
+                # Prüfe Cache für bessere Performance (Schluessel inkl. extension_id,
+                # sonst kollidieren gleichnamige Dateien mit verschiedener Endung)
+                in_cache = self.file_cache.check(dir_id, filename, extension_id)
+
                 if in_cache is True:
                     # Definitiv existiert = UPDATE
-                    updates.append((size, hash_val, dir_id, filename))
-                elif in_cache is False:
-                    # Definitiv neu = INSERT
-                    inserts.append((dir_id, filename, extension_id, size, hash_val))
-                    self.file_cache.add(dir_id, filename)
+                    updates.append((size, hash_val, dir_id, filename, extension_id))
                 else:
-                    # Cache unbekannt = muss einzeln geprüft werden
+                    # Cache unbekannt (None) = einzeln per DB-Check entscheiden.
+                    # (FileCache.check liefert nie False.)
                     self.cursor.execute("""
-                        SELECT 1 FROM files 
-                        WHERE directory_id = ? AND filename = ?
+                        SELECT 1 FROM files
+                        WHERE directory_id = ? AND filename = ? AND extension_id IS ?
                         LIMIT 1
-                    """, (dir_id, filename))
-                    
+                    """, (dir_id, filename, extension_id))
+
                     if self.cursor.fetchone():
-                        updates.append((size, hash_val, dir_id, filename))
-                        self.file_cache.add(dir_id, filename)
+                        updates.append((size, hash_val, dir_id, filename, extension_id))
+                        self.file_cache.add(dir_id, filename, extension_id)
                     else:
                         inserts.append((dir_id, filename, extension_id, size, hash_val))
-                        self.file_cache.add(dir_id, filename)
-            
+                        self.file_cache.add(dir_id, filename, extension_id)
+
             # Batch-UPDATE
             if updates:
                 self.cursor.executemany("""
-                    UPDATE files 
+                    UPDATE files
                     SET size = ?, hash = ?, modified_date = datetime('now')
-                    WHERE directory_id = ? AND filename = ?
+                    WHERE directory_id = ? AND filename = ? AND extension_id IS ?
                 """, updates)
             
             # Batch-INSERT
@@ -624,17 +680,54 @@ class DBManager:
 
     @with_lock
     def cleanup_removed_dirs(self, drive_id, scanned_paths_set):
-        self.cursor.execute("SELECT id, path FROM directories WHERE drive_id = ?", (drive_id,))
-        for dir_id, path in self.cursor.fetchall():
-            if path not in scanned_paths_set and not os.path.exists(path):
-                self.cursor.execute("DELETE FROM directories WHERE id = ?", (dir_id,))
+        """Entfernt Verzeichnisse dieses Laufwerks, die weder im frisch
+        gescannten Set enthalten sind NOCH auf dem Dateisystem existieren.
+
+        Hinweis: Spalte ist im aktuellen Schema 'full_path' (nicht 'path').
+        Die zu löschenden IDs werden zuerst vollständig ermittelt und erst
+        danach gelöscht, um Iteration und Mutation desselben Cursors zu trennen.
+        """
+        self.cursor.execute(
+            "SELECT id, full_path FROM directories WHERE drive_id = ?", (drive_id,)
+        )
+        stale_ids = [
+            dir_id
+            for dir_id, full_path in self.cursor.fetchall()
+            if full_path not in scanned_paths_set and not os.path.exists(full_path)
+        ]
+        for dir_id in stale_ids:
+            self.cursor.execute("DELETE FROM directories WHERE id = ?", (dir_id,))
 
     @with_lock
     def cleanup_removed_files(self, scanned_file_paths_set):
-        self.cursor.execute("SELECT id, file_path FROM files")
-        for file_id, path in self.cursor.fetchall():
-            if path not in scanned_file_paths_set and not os.path.exists(path):
-                self.cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        """Entfernt Dateien, die weder im frisch gescannten Set enthalten sind
+        NOCH auf dem Dateisystem existieren.
+
+        Der vollständige Pfad existiert im aktuellen Schema nicht mehr als
+        Spalte, sondern wird aus directories.full_path + files.filename +
+        Extension rekonstruiert. Die Platzhalter-Extension '[none]' (Dateien
+        ohne Endung) wird dabei NICHT an den Pfad angehängt.
+        """
+        self.cursor.execute(
+            """
+            SELECT f.id,
+                   d.full_path || '/' || f.filename ||
+                   CASE
+                       WHEN e.name IS NULL OR e.name = '[none]' THEN ''
+                       ELSE e.name
+                   END AS file_path
+            FROM files f
+            JOIN directories d ON f.directory_id = d.id
+            LEFT JOIN extensions e ON f.extension_id = e.id
+            """
+        )
+        stale_ids = [
+            file_id
+            for file_id, file_path in self.cursor.fetchall()
+            if file_path not in scanned_file_paths_set and not os.path.exists(file_path)
+        ]
+        for file_id in stale_ids:
+            self.cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
     @with_lock
     def clear_drive_data(self, drive_id):
@@ -676,8 +769,20 @@ class DBManager:
     @with_lock
     def close(self):
         logger.info("[DB Commit] Committing final changes on DB close.")
-        self.conn.commit()
-        self.conn.close()
+        # commit/close defensiv: bei bereits kaputter/geschlossener Verbindung werfen
+        # diese, DAS Singleton MUSS aber trotzdem zurueckgesetzt werden – sonst liefert
+        # get_db_instance() die tote Instanz erneut zurueck (Codex-Review P1).
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        # Singleton zurücksetzen, damit get_db_instance() eine neue Verbindung erstellt
+        global _db_instance
+        _db_instance = None
 
     @with_lock
     def acquire_scan_lock(self, scan_type="manual"):
@@ -699,7 +804,10 @@ class DBManager:
             import socket, os
             current_hostname = socket.gethostname()
             
-            if lock_hostname == current_hostname:
+            # Hostname-Vergleich robust (Groß/Kleinschreibung)
+            same_host = str(lock_hostname or "").strip().lower() == str(current_hostname or "").strip().lower()
+
+            if same_host:
                 import psutil
                 try:
                     # Wenn PID nicht mehr existiert, ist der Scan vermutlich abgestürzt
@@ -707,21 +815,62 @@ class DBManager:
                         logger.warning(f"[DB] Verwaister Scan-Lock gefunden (PID {lock_pid} existiert nicht mehr). Setze Lock zurück.")
                         self.release_scan_lock(lock_id)
                         active_scan = None
+                    else:
+                        # PID-Reuse absichern: nur echte Scan-Prozesse akzeptieren
+                        p = psutil.Process(lock_pid)
+                        cmdline = " ".join(p.cmdline()).lower()
+                        scan_markers = [
+                            "scanner_core.py",
+                            "scan_all_drives.py",
+                            "integrity_checker.py",
+                            "scheduled_scanner.py",
+                            "watchdog_service.py",
+                        ]
+                        if not any(m in cmdline for m in scan_markers):
+                            logger.warning(f"[DB] Verwaister Scan-Lock gefunden (PID {lock_pid} gehört nicht zu Scan-Prozess). Setze Lock zurück.")
+                            self.release_scan_lock(lock_id)
+                            active_scan = None
                 except:
-                    # Falls psutil nicht installiert/verfügbar
-                    logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+                    # Falls PID nicht prüfbar: alte Locks trotzdem heilen
+                    try:
+                        import datetime as _dt
+                        lock_dt = _dt.datetime.fromisoformat(str(lock_time))
+                        age = (_dt.datetime.now() - lock_dt).total_seconds()
+                        if age > 6 * 3600:
+                            logger.warning(f"[DB] PID {lock_pid} nicht prüfbar, aber Lock ist alt ({age/3600:.1f}h). Setze Lock zurück.")
+                            self.release_scan_lock(lock_id)
+                            active_scan = None
+                        else:
+                            logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+                    except Exception:
+                        logger.warning(f"[DB] Konnte PID {lock_pid} nicht prüfen. Nehme an, der Scan läuft noch.")
+            else:
+                # Fallback: sehr alte aktive Locks als verwaist behandeln (z.B. Hostname-Formatwechsel)
+                try:
+                    import datetime as _dt
+                    lock_dt = _dt.datetime.fromisoformat(str(lock_time))
+                    age = (_dt.datetime.now() - lock_dt).total_seconds()
+                    if age > 6 * 3600:
+                        logger.warning(f"[DB] Sehr alter aktiver Scan-Lock gefunden ({age/3600:.1f}h, Host {lock_hostname}). Setze Lock zurück.")
+                        self.release_scan_lock(lock_id)
+                        active_scan = None
+                except Exception:
+                    pass
             
             # Wenn immer noch ein aktiver Scan läuft, kein Lock erwerben
             if active_scan:
                 logger.warning(f"[DB] Kann Scan-Lock nicht erwerben, aktiver Scan im Gange: {lock_type} (PID: {lock_pid}@{lock_hostname}, Start: {lock_time})")
                 return None
         
-        # Kein aktiver Scan, wir können einen Lock erwerben
+        # Kein aktiver Scan, wir können einen Lock erwerben.
+        # Vorher: inaktive Historie selbst beschneiden (kein externer Cleanup noetig).
+        self.cleanup_scan_lock_history(keep_recent=SCAN_LOCK_HISTORY_KEEP)
+
         import socket, os, datetime
         current_time = datetime.datetime.now().isoformat()
         current_pid = os.getpid()
         current_hostname = socket.gethostname()
-        
+
         self.cursor.execute(
             "INSERT INTO scan_lock (scan_type, start_time, pid, hostname, is_active) VALUES (?, ?, ?, ?, 1)",
             (scan_type, current_time, current_pid, current_hostname)
@@ -767,9 +916,130 @@ class DBManager:
         Returns:
             bool: True wenn ein Scan aktiv ist, False sonst
         """
-        self.cursor.execute("SELECT COUNT(*) FROM scan_lock WHERE is_active=1")
-        count = self.cursor.fetchone()[0]
-        return count > 0
+        try:
+            self.cursor.execute("SELECT COUNT(*) FROM scan_lock WHERE is_active=1")
+            row = self.cursor.fetchone()
+            if row is None:
+                return False
+            count = row[0]
+            if count is None:
+                return False
+            return count > 0
+        except Exception:
+            return False
+
+    @with_lock
+    def heal_stale_scan_locks(self):
+        """Gibt verwaiste aktive scan_lock-Einträge frei.
+
+        Wird ein Scanner gekillt oder stürzt ab, bleibt sein Lock is_active=1
+        verwaist. is_scan_running() liefert dann dauerhaft True und blockiert
+        künftige Scans (scan_all_drives überspringt sonst ALLE Laufwerke).
+        Diese Methode gibt Locks frei, deren Prozess auf DIESEM Host nicht mehr
+        existiert. Locks lebender Prozesse und Locks fremder Hosts (PID nicht
+        prüfbar) bleiben unangetastet. Gibt die Anzahl freigegebener Locks zurück.
+        """
+        import socket
+        try:
+            import psutil
+        except Exception:
+            return 0
+        current_host = str(socket.gethostname() or "").strip().lower()
+        self.cursor.execute("SELECT id, pid, hostname FROM scan_lock WHERE is_active = 1")
+        rows = self.cursor.fetchall()
+        healed = 0
+        for lock_id, pid, hostname in rows:
+            same_host = str(hostname or "").strip().lower() == current_host
+            if not same_host:
+                continue  # PID auf fremdem Host nicht prüfbar -> konservativ behalten
+            try:
+                alive = psutil.pid_exists(pid)
+            except Exception:
+                alive = True  # im Zweifel behalten
+            if not alive:
+                self.cursor.execute("UPDATE scan_lock SET is_active = 0 WHERE id = ?", (lock_id,))
+                healed += 1
+                logger.info(f"[DB] Verwaisten Scan-Lock {lock_id} (PID {pid} tot) freigegeben.")
+        if healed:
+            self.conn.commit()
+        return healed
+
+    @with_lock
+    def cleanup_scan_lock_history(self, keep_recent=20):
+        """Entfernt alte, INAKTIVE scan_lock-Einträge (Audit-Bloat).
+
+        Behält alle aktiven Locks sowie die ``keep_recent`` neuesten inaktiven
+        Einträge. Gibt die Anzahl gelöschter Einträge zurück.
+        """
+        self.cursor.execute(
+            """
+            DELETE FROM scan_lock
+            WHERE is_active = 0
+              AND id NOT IN (
+                  SELECT id FROM scan_lock WHERE is_active = 0
+                  ORDER BY id DESC LIMIT ?
+              )
+            """,
+            (keep_recent,),
+        )
+        removed = self.cursor.rowcount
+        self.conn.commit()
+        return removed
+
+    @with_lock
+    def cleanup_orphan_extensions(self):
+        """Entfernt verwaiste, NICHT-standardisierte Extension-Einträge.
+
+        Löscht Extensions, die von KEINER Datei genutzt werden UND keinen
+        mime_type haben (= automatisch angelegte „Müll"-Extensions, die nach
+        dem Löschen ihrer Dateien zurückbleiben, da es kein CASCADE auf
+        extensions gibt). Standard-Extensions (mit mime_type) und aktuell
+        genutzte bleiben unangetastet. Gibt die Anzahl gelöschter Einträge zurück.
+        """
+        self.cursor.execute(
+            """
+            DELETE FROM extensions
+            WHERE mime_type IS NULL
+              AND id NOT IN (
+                  SELECT DISTINCT extension_id FROM files
+                  WHERE extension_id IS NOT NULL
+              )
+            """
+        )
+        removed = self.cursor.rowcount
+        self.conn.commit()
+        return removed
+
+    def read_query(self, sql, params=()):
+        """Führt eine reine Lese-Abfrage aus und gibt fetchall() zurück.
+
+        Für Datei-DBs wird eine SEPARATE read-only Connection verwendet, damit
+        Lesezugriffe (GUI, Reports) nicht vom Schreib-Lock der Haupt-Connection
+        blockiert werden – SQLite WAL erlaubt einen Writer und beliebig viele
+        Reader gleichzeitig. Für ':memory:' (Tests) wird die Haupt-Connection
+        mit eigenem Cursor genutzt, da es dort keinen separaten Pfad gibt.
+        """
+        if self.path == ":memory:":
+            with _db_lock:
+                cur = self.conn.cursor()
+                try:
+                    cur.execute(sql, params)
+                    return cur.fetchall()
+                finally:
+                    cur.close()
+
+        conn = sqlite3.connect(
+            "file:" + self.path.replace("\\", "/") + "?mode=ro",
+            uri=True,
+            timeout=30.0,
+        )
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            conn.close()
 
 def get_db_instance(path=None):
     """Gibt eine globale, thread-sichere Singleton-Instanz des DBManagers zurück."""
@@ -777,6 +1047,14 @@ def get_db_instance(path=None):
     with _db_lock: # Schützt den Zugriff auf globale Variablen
         # Bestimme den zu verwendenden Pfad: Übergebener Pfad hat Vorrang, sonst Standard aus utils
         db_path_to_use = path or DB_PATH
+
+        # Sicherheitscheck: Instanz vorhanden aber Verbindung bereits geschlossen?
+        if _db_instance is not None:
+            try:
+                _db_instance.conn.execute("SELECT 1")
+            except Exception:
+                logger.warning("[DB] Bestehende Instanz hat geschlossene Verbindung – wird neu erstellt.")
+                _db_instance = None
 
         if _db_instance is None:
             # Erster Aufruf oder nach Schließen/Änderung

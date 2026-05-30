@@ -1,14 +1,44 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
+import stat
 import time # Für mögliche Pausen
 import sqlite3
 from datetime import datetime
 import argparse # Importieren
 import logging # Hinzufügen
 
+
+def _is_reparse_point(path):
+    """True, wenn ``path`` ein Windows-Reparse-Point (Junction/Symlink) ist.
+
+    Zyklische Junctions (z.B. "AppData\\Local\\Anwendungsdaten" -> "AppData\\Local"
+    oder "Documents and Settings" -> "Users") wuerden os.walk sonst in
+    Endlos-Rekursion treiben und hunderttausende Phantom-Verzeichnisse erzeugen.
+    Solche Reparse-Points werden beim Scan NICHT betreten.
+
+    Sicher plattformuebergreifend: faellt auf os.path.islink zurueck, wenn die
+    Windows-Dateiattribute nicht verfuegbar sind.
+    """
+    try:
+        attrs = os.lstat(path).st_file_attributes
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
+        try:
+            return os.path.islink(path)
+        except OSError:
+            return False
+
 # Importiere zentrale Funktionen und Konstanten
 from utils import calculate_hash, HASHING, CONFIG, DB_PATH, load_config, logger # logger importieren
 from models import get_db_instance
+
+# ScanLock optional import (prozessübergreifende Pause für Watchdog während Core-Scan)
+try:
+    from scan_lock import write_scan_lockfile, remove_scan_lockfile
+    _scan_lock_available = True
+except Exception:
+    _scan_lock_available = False
 
 # --- Entferne alte, lokale Funktionen --- 
 # def load_config():
@@ -142,7 +172,14 @@ def run_scan(base_path, force_restart=False):
         for root, dirs, files in os.walk(base_path, topdown=True):
             current_dir = os.path.normpath(root)
             process_this_dir_and_files = True # Standardmäßig alles verarbeiten
-            
+
+            # ---- Junction/Reparse-Point-Schutz (topdown=True nutzt In-Place-Filter) ----
+            # Zyklische Windows-Junctions (z.B. AppData\Local\Anwendungsdaten ->
+            # AppData\Local) wuerden os.walk in Endlos-Rekursion treiben. Solche
+            # Reparse-Points NICHT betreten.
+            if dirs:
+                dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))]
+
             # ---- Überspringe problematische Windows-Ordner ----
             skip_this_dir = False
             for skip_path in SKIP_PATHS:
@@ -529,20 +566,24 @@ def main():
     # Prüfe, ob bereits ein Scan läuft und erwerbe einen Lock
     scan_type = "scheduled" if args.scheduled else "manual"
     
-    # Wenn --force angegeben wurde, prüfen wir nicht auf laufende Scans
-    if not args.force:
-        if db.is_scan_running():
-            logger.error(f"[Core Scan] Ein anderer Scan läuft bereits. Dieser Scan wird abgebrochen. Verwende --force, um den Scan trotzdem zu starten.")
-            sys.exit(2)
-    
-    # Erwerbe Lock (auch wenn --force verwendet wird, damit andere Scans den aktiven Scan sehen)
+    # Erwerbe Lock direkt über DBManager (inkl. Stale-Lock-Heilung)
     lock_id = db.acquire_scan_lock(scan_type=scan_type)
-    if not lock_id and not args.force:
-        logger.error(f"[Core Scan] Konnte keinen Scan-Lock erwerben. Möglicherweise läuft ein anderer Scan. Verwende --force, um den Scan trotzdem zu starten.")
-        sys.exit(3)
+    if not lock_id:
+        if not args.force:
+            logger.error(f"[Core Scan] Konnte keinen Scan-Lock erwerben. Möglicherweise läuft ein anderer Scan. Verwende --force, um den Scan trotzdem zu starten.")
+            sys.exit(3)
+        else:
+            logger.warning("[Core Scan] --force aktiv: starte trotz fehlendem DB-Scan-Lock.")
     
-    # Scan-Ausführung in try-finally Block, damit der Lock auf jeden Fall freigegeben wird
+    # Scan-Ausführung in try-finally Block, damit Locks auf jeden Fall freigegeben werden
     try:
+        # Prozessübergreifende Scan-Lockdatei setzen, damit Watchdog-FSHandler pausiert
+        if _scan_lock_available:
+            try:
+                write_scan_lockfile(f"scanner_core:{scan_path}")
+            except Exception as e:
+                logger.warning(f"[Core Scan] Konnte Scan-Lockdatei nicht setzen: {e}")
+
         # Starte den Scan mit dem force_restart Flag aus den Argumenten
         success = run_scan(scan_path, force_restart=args.restart)
 
@@ -553,7 +594,14 @@ def main():
             logger.error("[Core Scan] Programm mit Fehlern beendet.") # Geändert auf logger.error
             exit_code = 1
     finally:
-        # Lock freigeben, auch wenn ein Fehler auftrat
+        # Lockdatei entfernen (wenn gesetzt), auch bei Fehlern
+        if _scan_lock_available:
+            try:
+                remove_scan_lockfile()
+            except Exception as e:
+                logger.warning(f"[Core Scan] Konnte Scan-Lockdatei nicht entfernen: {e}")
+
+        # DB-Scan-Lock freigeben, auch wenn ein Fehler auftrat
         if lock_id:
             db.release_scan_lock(lock_id)
             logger.info(f"[Core Scan] Scan-Lock {lock_id} freigegeben.")

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import hashlib
 from datetime import datetime
@@ -13,6 +14,21 @@ CONFIG_PATH = os.path.join(PROJECT_DIR, 'config.json') # Config Path als Konstan
 
 # Globaler Logger wird später initialisiert
 logger = None
+
+# Standard-Konfiguration als Modul-Konstante. WICHTIG: muss auf Modulebene
+# stehen, damit auch der Modul-Level-Init-Code unten (Fehlerbehandlung bei
+# fehlender/korrupter config.json) darauf zugreifen kann – andernfalls
+# NameError beim Import und die gesamte App startet nicht.
+DEFAULT_CONFIG = {
+    "base_path": None,
+    "log_level": "INFO",
+    "hashing": False,
+    "hash_directories": [],
+    "resume_scan": True,
+    "scheduled_scans": [],
+    "watchdog_auto_paths": []
+}
+
 
 def calculate_hash(filepath):
     """Berechnet den SHA256-Hash einer Datei. Gibt None bei Fehlern zurück."""
@@ -37,16 +53,7 @@ def calculate_hash(filepath):
 
 def load_config():
     """Lädt die Konfiguration aus config.json."""
-    # DEFAULT_CONFIG wie zuvor
-    DEFAULT_CONFIG = {
-        "base_path": None,
-        "log_level": "INFO",
-        "hashing": False,
-        "hash_directories": [],
-        "resume_scan": True,
-        "scheduled_scans": [],
-        "watchdog_auto_paths": []
-    }
+    # Verwendet die Modul-Konstante DEFAULT_CONFIG (siehe oben).
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -111,6 +118,18 @@ def _create_fallback_logger():
         fallback_logger.setLevel(logging.WARNING) # Mindestens Warnungen anzeigen
     return fallback_logger
 
+class _WinSafeRotatingHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler der auf Windows PermissionError bei der Log-Rotation ignoriert.
+    Wenn eine andere Prozess die Log-Datei offen hält, wird die Rotation übersprungen
+    und in die aktuelle Datei weitergeschrieben statt abzustürzen.
+    """
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except PermissionError:
+            pass  # Andere Prozess hat die Datei offen — Rotation überspringen
+
+
 def setup_logging(log_filename="scanner.log", level_str="INFO", logger_name=None):
     try:
         # Konvertiere Level-String zu logging Level
@@ -135,10 +154,10 @@ def setup_logging(log_filename="scanner.log", level_str="INFO", logger_name=None
         max_bytes = 10 * 1024 * 1024 # 10 MB
         backup_count = 5
         # Versuche den Handler zu erstellen und hinzuzufügen
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file_path, 
-            maxBytes=max_bytes, 
-            backupCount=backup_count, 
+        file_handler = _WinSafeRotatingHandler(
+            log_file_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
             encoding='utf-8'
         )
         file_handler.setFormatter(log_formatter)

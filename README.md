@@ -2,6 +2,8 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Windows">
   <img src="https://img.shields.io/badge/database-SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite">
+  <img src="https://img.shields.io/badge/GUI-PyQt5-41CD52?style=flat-square&logo=qt&logoColor=white" alt="PyQt5">
+  <img src="https://img.shields.io/badge/tests-65%20passing-brightgreen?style=flat-square" alt="65 Tests">
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License">
 </p>
 
@@ -23,6 +25,7 @@ A high-performance Windows filesystem scanner that builds and maintains a normal
 - **Scheduled Scans** via configurable cron-like schedule (integrity checks, full rescans)
 - **Windows Service** support via NSSM for production deployments
 - **Portable** — runs from USB drives, no installation required
+- **65 automated tests** covering core engine, DB layer, utils, and export
 
 ## Architecture
 
@@ -56,16 +59,17 @@ A high-performance Windows filesystem scanner that builds and maintains a normal
 | `watchdog_service.py` | Long-running service wrapper with heartbeat monitoring and retry logic |
 | `watchdog_control.py` | Process management for starting/stopping the watchdog safely |
 | `drive_alias_detector.py` | Detects network drive aliases to prevent duplicate database entries |
-| `gui_launcher.py` | PyQt5 GUI with worker threads communicating via Qt signals |
+| `gui_launcher.py` | **PyQt5** GUI with worker threads communicating via Qt signals |
 | `systray_launcher_full.py` | System tray with NSSM service integration and Explorer icon |
 | `integrity_checker.py` | Database-filesystem consistency verification |
 | `exporter.py` | Export to CSV, JSON, and HTML with path filtering |
+| `scan_lock.py` | Filesystem-level lock file for inter-process coordination |
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.10+ on Windows
+- Python 3.10+ on Windows (`D:\Python313\python.exe` recommended)
 - Install dependencies:
   ```bash
   pip install -r requirements.txt
@@ -109,6 +113,29 @@ install_autostart.bat
 # Repair existing service configuration
 fix_watchdog_autostart.bat
 ```
+
+## Running Tests
+
+```bash
+# All 65 tests
+python -m pytest tests/ -v
+
+# Specific module
+python -m pytest tests/test_models.py -v
+python -m pytest tests/test_utils.py -v
+python -m pytest tests/test_scanner_core.py -v
+```
+
+**Test coverage:**
+
+| Test file | Tests | Covers |
+|-----------|-------|--------|
+| `test_models.py` | 28 | DBManager schema, CRUD, scan lock, cache |
+| `test_utils.py` | 10 | Hash, config load/save, drives |
+| `test_exporter.py` | 10 | CSV, JSON, HTML export |
+| `test_scanner_core.py` | 8 | Scan engine integration |
+| `test_scan_lock.py` | 6 | Lockfile coordination |
+| `test_drive_alias_detector.py` | 3 | Alias detection |
 
 ## Database
 
@@ -164,13 +191,31 @@ Located in `Dateien_Skripte/`:
 ## Dependencies
 
 ```
-watchdog          # Filesystem event monitoring
-PyQt5             # GUI framework
-pystray           # System tray integration
-Pillow            # Image processing
-psutil            # Process management
-pyinstaller       # Building portable executables
+watchdog==6.0.0     # Filesystem event monitoring
+PyQt5==5.15.11      # GUI framework (gui_launcher, systray, most tools)
+PyQt6==6.10.0       # only Dateien_Skripte/Space_Recovery_Advisor.py
+pystray==0.19.5     # System tray integration
+Pillow==10.4.0      # Image processing
+psutil==5.9.6       # Process management
+pyinstaller==6.12.0 # Building portable executables
 ```
+
+See `requirements.txt` for the authoritative, pinned dependency list.
+
+## GUI Framework Status
+
+The main GUI (`gui_launcher.py`), the system tray (`systray_launcher_full.py`)
+and most utility scripts in `Dateien_Skripte/` use **PyQt5** (5.15.x). A single
+tool — `Dateien_Skripte/Space_Recovery_Advisor.py` — currently uses PyQt6.
+
+A full migration to PyQt6 is **not** complete and is tracked on the roadmap.
+Until then the project depends on both PyQt5 and PyQt6 (see `requirements.txt`).
+A future migration would involve:
+
+- Fully-qualified Qt enums (`Qt.AlignmentFlag.AlignCenter`, `QMessageBox.StandardButton.Yes`, …)
+- `exec_()` → `exec()`
+- `QFileSystemModel` and `QAction` moving from `QtWidgets` → `QtGui`
+- Replacing `setProcessState()` usage with explicit signal disconnection
 
 ## License
 
