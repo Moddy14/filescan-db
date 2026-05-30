@@ -1,11 +1,33 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import stat
 import time # Für mögliche Pausen
 import sqlite3
 from datetime import datetime
 import argparse # Importieren
 import logging # Hinzufügen
+
+
+def _is_reparse_point(path):
+    """True, wenn ``path`` ein Windows-Reparse-Point (Junction/Symlink) ist.
+
+    Zyklische Junctions (z.B. "AppData\\Local\\Anwendungsdaten" -> "AppData\\Local"
+    oder "Documents and Settings" -> "Users") wuerden os.walk sonst in
+    Endlos-Rekursion treiben und hunderttausende Phantom-Verzeichnisse erzeugen.
+    Solche Reparse-Points werden beim Scan NICHT betreten.
+
+    Sicher plattformuebergreifend: faellt auf os.path.islink zurueck, wenn die
+    Windows-Dateiattribute nicht verfuegbar sind.
+    """
+    try:
+        attrs = os.lstat(path).st_file_attributes
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
+        try:
+            return os.path.islink(path)
+        except OSError:
+            return False
 
 # Importiere zentrale Funktionen und Konstanten
 from utils import calculate_hash, HASHING, CONFIG, DB_PATH, load_config, logger # logger importieren
@@ -150,7 +172,14 @@ def run_scan(base_path, force_restart=False):
         for root, dirs, files in os.walk(base_path, topdown=True):
             current_dir = os.path.normpath(root)
             process_this_dir_and_files = True # Standardmäßig alles verarbeiten
-            
+
+            # ---- Junction/Reparse-Point-Schutz (topdown=True nutzt In-Place-Filter) ----
+            # Zyklische Windows-Junctions (z.B. AppData\Local\Anwendungsdaten ->
+            # AppData\Local) wuerden os.walk in Endlos-Rekursion treiben. Solche
+            # Reparse-Points NICHT betreten.
+            if dirs:
+                dirs[:] = [d for d in dirs if not _is_reparse_point(os.path.join(root, d))]
+
             # ---- Überspringe problematische Windows-Ordner ----
             skip_this_dir = False
             for skip_path in SKIP_PATHS:
