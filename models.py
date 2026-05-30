@@ -920,6 +920,42 @@ class DBManager:
             return False
 
     @with_lock
+    def heal_stale_scan_locks(self):
+        """Gibt verwaiste aktive scan_lock-Einträge frei.
+
+        Wird ein Scanner gekillt oder stürzt ab, bleibt sein Lock is_active=1
+        verwaist. is_scan_running() liefert dann dauerhaft True und blockiert
+        künftige Scans (scan_all_drives überspringt sonst ALLE Laufwerke).
+        Diese Methode gibt Locks frei, deren Prozess auf DIESEM Host nicht mehr
+        existiert. Locks lebender Prozesse und Locks fremder Hosts (PID nicht
+        prüfbar) bleiben unangetastet. Gibt die Anzahl freigegebener Locks zurück.
+        """
+        import socket
+        try:
+            import psutil
+        except Exception:
+            return 0
+        current_host = str(socket.gethostname() or "").strip().lower()
+        self.cursor.execute("SELECT id, pid, hostname FROM scan_lock WHERE is_active = 1")
+        rows = self.cursor.fetchall()
+        healed = 0
+        for lock_id, pid, hostname in rows:
+            same_host = str(hostname or "").strip().lower() == current_host
+            if not same_host:
+                continue  # PID auf fremdem Host nicht prüfbar -> konservativ behalten
+            try:
+                alive = psutil.pid_exists(pid)
+            except Exception:
+                alive = True  # im Zweifel behalten
+            if not alive:
+                self.cursor.execute("UPDATE scan_lock SET is_active = 0 WHERE id = ?", (lock_id,))
+                healed += 1
+                logger.info(f"[DB] Verwaisten Scan-Lock {lock_id} (PID {pid} tot) freigegeben.")
+        if healed:
+            self.conn.commit()
+        return healed
+
+    @with_lock
     def cleanup_scan_lock_history(self, keep_recent=20):
         """Entfernt alte, INAKTIVE scan_lock-Einträge (Audit-Bloat).
 

@@ -123,7 +123,16 @@ def main():
         if _scan_lock_imported:
             remove_scan_lockfile()
         sys.exit(1)
-        
+
+    # Verwaiste Scan-Locks abgestürzter/gekillter Scans heilen, sonst würde
+    # is_scan_running() dauerhaft True liefern und ALLE Laufwerke übersprungen.
+    try:
+        healed = db.heal_stale_scan_locks()
+        if healed:
+            logger.warning(f"{healed} verwaisten Scan-Lock(s) freigegeben (toter Prozess).")
+    except Exception as e:
+        logger.warning(f"Konnte verwaiste Scan-Locks nicht prüfen: {e}")
+
     # Verfügbare Laufwerke holen (nur kanonische, ohne Aliases)
     try:
         from drive_alias_detector import get_canonical_drive_list
