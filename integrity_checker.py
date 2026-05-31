@@ -40,6 +40,12 @@ def check_integrity(db, check_base_path=None):
     updated_files = 0
     checked_dirs = 0
     checked_files = 0
+    missing_dir_paths = []
+    missing_file_paths = []
+
+    # Separater Cursor fuer Schreiboperationen (DELETE/UPDATE)
+    # WICHTIG: executemany auf dem gleichen Cursor zerstoert laufende SELECT-Ergebnisse!
+    write_cursor = db.conn.cursor()
 
     try:
         # --- Gesamtzahlen ermitteln (fuer Fortschritt) ---
@@ -80,17 +86,18 @@ def check_integrity(db, check_base_path=None):
         dirs_to_delete = []
         for dir_id, full_path in dirs_to_check:
             checked_dirs += 1
-            if checked_dirs % 100 == 0 or checked_dirs == total_dirs:
+            if checked_dirs % 5000 == 0 or checked_dirs == total_dirs:
                 _emit(f"@@PROGRESS:{checked_dirs}:{total_dirs}")
             # Pruefe Existenz
             if not os.path.isdir(full_path):
                 dirs_to_delete.append((dir_id,))
+                missing_dir_paths.append(full_path)
                 logger.error(f"[FEHLT] Verzeichnis fehlt: {full_path}")
                 missing_dirs += 1
 
         if dirs_to_delete:
             logger.info(f"[Integritaet] Entferne {len(dirs_to_delete)} fehlende Verzeichnisse...")
-            cursor.executemany("DELETE FROM directories WHERE id = ?", dirs_to_delete)
+            write_cursor.executemany("DELETE FROM directories WHERE id = ?", dirs_to_delete)
             db.conn.commit()
 
         # Abschluss-Fortschritt fuer Verzeichnisse
@@ -126,7 +133,7 @@ def check_integrity(db, check_base_path=None):
 
             for file_id, file_path, size_old, hash_old in files_chunk:
                 checked_files += 1
-                if checked_files % 200 == 0 or checked_files == total_files:
+                if checked_files % 5000 == 0 or checked_files == total_files:
                     _emit(f"@@PROGRESS:{checked_files}:{total_files}")
 
                 # Normalisiere Pfad fuer Windows-Kompatibilitaet
@@ -135,6 +142,7 @@ def check_integrity(db, check_base_path=None):
                 # Pruefe Existenz
                 if not os.path.isfile(file_path):
                     files_to_delete.append((file_id,))
+                    missing_file_paths.append(file_path)
                     logger.error(f"[FEHLT] Datei fehlt: {file_path}")
                     missing_files += 1
                 else:
@@ -157,21 +165,22 @@ def check_integrity(db, check_base_path=None):
                         logger.error(f"[Integritaet Fehler] Keine Berechtigung fuer Datei: {file_path}")
                     except FileNotFoundError:
                         files_to_delete.append((file_id,))
+                        missing_file_paths.append(file_path)
                         logger.error(f"[FEHLT] Datei fehlt (trotz isfile): {file_path}")
                         missing_files += 1
                     except Exception as e:
                         logger.error(f"[Integritaet Fehler] Unerwarteter Fehler bei Pruefung von {file_path}: {e}")
 
-            # Loesche fehlende Dateien im Chunk
+            # Loesche fehlende Dateien im Chunk (write_cursor!)
             if files_to_delete:
                 logger.info(f"[Integritaet] Entferne {len(files_to_delete)} fehlende Dateien...")
-                cursor.executemany("DELETE FROM files WHERE id = ?", files_to_delete)
+                write_cursor.executemany("DELETE FROM files WHERE id = ?", files_to_delete)
                 files_to_delete.clear()
 
-            # Aktualisiere geaenderte Dateien im Chunk
+            # Aktualisiere geaenderte Dateien im Chunk (write_cursor!)
             if files_to_update:
                 logger.info(f"[Integritaet] Aktualisiere {len(files_to_update)} geaenderte Dateien...")
-                cursor.executemany("UPDATE files SET size = ?, hash = ? WHERE id = ?", files_to_update)
+                write_cursor.executemany("UPDATE files SET size = ?, hash = ? WHERE id = ?", files_to_update)
                 files_to_update.clear()
 
             # Commit nach jedem Chunk
@@ -187,12 +196,28 @@ def check_integrity(db, check_base_path=None):
         logger.info(f"   Geprueft: {checked_dirs} Verzeichnisse, {checked_files} Dateien.")
         logger.info(f"   Resultat: {missing_dirs} fehlende Verz., {missing_files} fehlende Dateien, {updated_files} geaenderte Dateien.")
 
+        # Fehlende Pfade nach Laufwerk gruppieren
+        def _group_by_drive(paths):
+            grouped = {}
+            for p in paths:
+                # Laufwerksbuchstabe extrahieren (z.B. "C:" aus "C:/Users/...")
+                drive = os.path.splitdrive(p)[0].upper() or "?"
+                grouped.setdefault(drive, []).append(p)
+            return grouped
+
+        missing_dirs_by_drive = _group_by_drive(missing_dir_paths)
+        missing_files_by_drive = _group_by_drive(missing_file_paths)
+
         # Strukturiertes Ergebnis fuer GUI
         result = {
             "checked_dirs": checked_dirs,
             "missing_dirs": missing_dirs,
+            "missing_dirs_by_drive": {k: len(v) for k, v in missing_dirs_by_drive.items()},
+            "missing_dir_paths": missing_dir_paths,
             "checked_files": checked_files,
             "missing_files": missing_files,
+            "missing_files_by_drive": {k: len(v) for k, v in missing_files_by_drive.items()},
+            "missing_file_paths": missing_file_paths,
             "updated_files": updated_files,
             "duration": round(duration, 2)
         }
@@ -222,6 +247,7 @@ def check_integrity(db, check_base_path=None):
         import traceback
         logger.error(traceback.format_exc())
     finally:
+        write_cursor.close()
         cursor.close()
 
 
@@ -238,18 +264,33 @@ def main():
     else:
         logger.info("[Integritaet] Kein Pfadfilter angegeben, pruefe gesamte Datenbank.")
 
+    # Lockdatei schreiben → Watchdog-FSHandler pausieren
+    try:
+        from scan_lock import write_scan_lockfile, remove_scan_lockfile
+        write_scan_lockfile("integrity_checker")
+        _scan_lock_imported = True
+    except Exception as e:
+        logger.warning(f"[Integritaet] scan_lock nicht verfügbar: {e}")
+        _scan_lock_imported = False
+
     try:
         db = get_db_instance()
         if not db:
             logger.critical("[Integritaet Fehler] Konnte DB-Instanz nicht erhalten.")
+            if _scan_lock_imported:
+                remove_scan_lockfile()
             sys.exit(1)
 
         check_integrity(db, check_path)
         logger.info("[Integritaet] Programm beendet.")
+        if _scan_lock_imported:
+            remove_scan_lockfile()
         sys.exit(0)
 
     except Exception as e:
         logger.critical(f"[Integritaet Fehler] Unerwarteter Fehler im Hauptablauf: {e}")
+        if _scan_lock_imported:
+            remove_scan_lockfile()
         sys.exit(1)
 
 if __name__ == "__main__":

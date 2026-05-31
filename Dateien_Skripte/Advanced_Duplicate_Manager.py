@@ -24,6 +24,7 @@ class DuplicateScanThread(QThread):
     progress = pyqtSignal(str)
     result_files = pyqtSignal(list)
     result_folders = pyqtSignal(list)
+    debug_log = pyqtSignal(str)  # Debug-Nachrichten
     
     def __init__(self, db_path, options):
         super().__init__()
@@ -32,6 +33,13 @@ class DuplicateScanThread(QThread):
         
     def run(self):
         try:
+            import datetime as _dt
+            self.debug_log.emit("=" * 60)
+            self.debug_log.emit(f"🔍 DUPLIKAT-SUCHE GESTARTET - {_dt.datetime.now().strftime('%H:%M:%S')}")
+            self.debug_log.emit(f"📂 Datenbank: {self.db_path}")
+            self.debug_log.emit(f"\n📋 OPTIONEN:")
+            for key, val in self.options.items():
+                self.debug_log.emit(f"   {key}: {repr(val)}")
             conn = sqlite3.connect(self.db_path)
             conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.cursor()
@@ -179,8 +187,22 @@ class DuplicateScanThread(QThread):
 
         # Params fuer CTE + LIMIT ist implizit + Params fuer aeusseres WHERE
         final_params = all_params + all_params
+        
+        # DEBUG: Query und Parameter loggen
+        self.debug_log.emit(f"\n📊 DATEI-DUPLIKAT QUERY:")
+        self.debug_log.emit(f"   WHERE: {where_sql}")
+        self.debug_log.emit(f"   Extra: {extra_clauses}")
+        self.debug_log.emit(f"   Parameter: {final_params}")
+        self.debug_log.emit(f"\n   SQL:\n{query[:500]}...")
+        
         cursor.execute(query, final_params)
         results = cursor.fetchall()
+        
+        self.debug_log.emit(f"\n✅ {len(results)} Duplikat-Zeilen gefunden")
+        for i, row in enumerate(results[:5]):
+            self.debug_log.emit(f"   [{i}] Pfad={row[1]}, Name={row[2]}{row[3]}, Size={row[4]}, Dups={row[7]}")
+        if len(results) > 5:
+            self.debug_log.emit(f"   ... und {len(results)-5} weitere")
 
         # Gruppiere und markiere Backup-Status
         grouped = defaultdict(list)
@@ -240,8 +262,20 @@ class DuplicateScanThread(QThread):
         HAVING file_count > 5  -- Nur Ordner mit mehr als 5 Dateien
         """
         
+        # DEBUG: Ordner-Query loggen
+        self.debug_log.emit(f"\n📊 ORDNER-DUPLIKAT QUERY:")
+        self.debug_log.emit(f"   WHERE: {where_sql}")
+        self.debug_log.emit(f"   Parameter: {params}")
+        self.debug_log.emit(f"   Similarity Threshold: {similarity_threshold}%")
+        
         cursor.execute(query, params)
         folders = cursor.fetchall()
+        
+        self.debug_log.emit(f"\n✅ {len(folders)} Ordner mit >5 Dateien gefunden")
+        for i, f in enumerate(folders[:5]):
+            self.debug_log.emit(f"   [{i}] {f[2]}:{f[1]} ({f[3]} Dateien, {f[4]} Bytes)")
+        if len(folders) > 5:
+            self.debug_log.emit(f"   ... und {len(folders)-5} weitere")
         
         self.progress.emit(f"Vergleiche {len(folders)} Ordner...")
         
@@ -340,6 +374,30 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
         self.folder_tab = QtWidgets.QWidget()
         self.setup_folder_tab()
         self.tab_widget.addTab(self.folder_tab, "Ordner-Duplikate")
+        
+        # --- DEBUG-Panel ---
+        self.debug_group = QtWidgets.QGroupBox("🐛 Debug-Log (SQL-Queries & Filter)")
+        self.debug_group.setCheckable(True)
+        self.debug_group.setChecked(False)  # Standardmäßig zugeklappt
+        debug_layout = QtWidgets.QVBoxLayout()
+        self.debug_text = QtWidgets.QPlainTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setMaximumHeight(250)
+        self.debug_text.setFont(QtGui.QFont("Consolas", 9))
+        self.debug_text.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc; border: 1px solid #555;")
+        debug_btn_layout = QtWidgets.QHBoxLayout()
+        debug_clear_btn = QtWidgets.QPushButton("🗑️ Log leeren")
+        debug_clear_btn.clicked.connect(self.debug_text.clear)
+        debug_copy_btn = QtWidgets.QPushButton("📋 Log kopieren")
+        debug_copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.debug_text.toPlainText()))
+        debug_btn_layout.addWidget(debug_clear_btn)
+        debug_btn_layout.addWidget(debug_copy_btn)
+        debug_btn_layout.addStretch()
+        debug_layout.addWidget(self.debug_text)
+        debug_layout.addLayout(debug_btn_layout)
+        self.debug_group.setLayout(debug_layout)
+        main_layout.addWidget(self.debug_group)
+        # --- Ende DEBUG-Panel ---
         
         # Status Bar
         self.status_bar = self.statusBar()
@@ -565,6 +623,7 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
         self.scan_thread = DuplicateScanThread(self.db_path, options)
         self.scan_thread.progress.connect(self.update_status)
         self.scan_thread.result_files.connect(self.show_file_results)
+        self.scan_thread.debug_log.connect(self._append_debug)
         self.scan_thread.start()
     
     def search_folder_duplicates(self):
@@ -583,7 +642,12 @@ class AdvancedDuplicateManager(QtWidgets.QMainWindow):
         self.scan_thread = DuplicateScanThread(self.db_path, options)
         self.scan_thread.progress.connect(self.update_status)
         self.scan_thread.result_folders.connect(self.show_folder_results)
+        self.scan_thread.debug_log.connect(self._append_debug)
         self.scan_thread.start()
+    
+    def _append_debug(self, msg):
+        """Debug-Nachricht ans Log anhängen"""
+        self.debug_text.appendPlainText(msg)
     
     def update_status(self, message):
         """Aktualisiert die Statusleiste"""

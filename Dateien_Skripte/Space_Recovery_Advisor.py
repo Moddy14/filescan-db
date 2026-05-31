@@ -256,6 +256,18 @@ class DeleteThread(QThread):
             # Backup-Pfad berechnen: D:\FOTO\2025 → N:\BACKUP\FOTO\2025
             backup_dir = None
             if self.backup_root:
+                # KRITISCH: Prüfe ob Backup-Laufwerk überhaupt erreichbar ist!
+                backup_drive = os.path.splitdrive(self.backup_root)[0]
+                if backup_drive and not os.path.exists(backup_drive + '\\'):
+                    self._log(f"ABBRUCH: Backup-Laufwerk {backup_drive} nicht erreichbar!")
+                    self.error.emit(
+                        f"Backup-Laufwerk {backup_drive} ist nicht erreichbar!\n\n"
+                        f"Bitte Laufwerk anschliessen und erneut versuchen.\n"
+                        f"Ohne Backup wird NICHT geloescht."
+                    )
+                    conn.close()
+                    return
+
                 # win_base = "D:\Daten\Fotos\2025"
                 # → Laufwerk entfernen: "Daten\Fotos\2025"
                 # → Backup: "N:\BACKUP\Daten\Fotos\2025"
@@ -272,9 +284,15 @@ class DeleteThread(QThread):
                     os.makedirs(backup_dir, exist_ok=True)
                     self._log(f"Backup-Ordner: {backup_dir}")
                 except Exception as e:
-                    self._log(f"FEHLER Backup-Ordner: {backup_dir}: {e}")
-                    errors.append(f"Backup-Ordner Fehler: {e}")
-                    backup_dir = None  # Backup deaktivieren, aber weitermachen
+                    self._log(f"ABBRUCH: Backup-Ordner kann nicht erstellt werden: {backup_dir}: {e}")
+                    self.error.emit(
+                        f"Backup-Ordner kann nicht erstellt werden!\n\n"
+                        f"Pfad: {backup_dir}\n"
+                        f"Fehler: {e}\n\n"
+                        f"Ohne Backup wird NICHT geloescht."
+                    )
+                    conn.close()
+                    return
 
             # 2) Datei für Datei: [backup →] löschen → prüfen → DB updaten
             for i, f in enumerate(targets):
@@ -327,8 +345,8 @@ class DeleteThread(QThread):
                                     "Add-Type -AssemblyName Microsoft.VisualBasic; "
                                     "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
                                     f"'{ps_path}',"
-                                    "'UIOption.OnlyErrorDialogs',"
-                                    "'RecycleOption.SendToRecycleBin')"
+                                    "[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,"
+                                    "[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)"
                                 )
                                 r = subprocess.run(
                                     ['powershell', '-NoProfile', '-Command', ps_cmd],
@@ -649,9 +667,10 @@ class MergeThread(QThread):
 
                     # DB-Eintrag anlegen
                     try:
-                        base, ext = os.path.splitext(fname)
-                        if not ext:
-                            ext = '[none]'
+                        # Gleiche Endungs-Plausibilitaet wie der Scanner: verhindert
+                        # Muell-Endungen (.0, Hashes) und gleichnamige-Datei-Kollisionen.
+                        from models import split_name_ext
+                        base, ext = split_name_ext(fname)
 
                         # Extension-ID holen
                         c.execute("SELECT id FROM extensions WHERE name = ?", (ext,))
@@ -1270,9 +1289,18 @@ class SpaceRecoveryAdvisor(QMainWindow):
         # Matched files für den Thread vorbereiten
         matched_for_thread = [{'name': m['name'], 'size': m['size']} for m in matched]
 
-        # Speicherplatz-Check (für Backup)
+        # Backup-Laufwerk Erreichbarkeits-Check (KRITISCH!)
         bkp_root = self._get_backup_root()
         if bkp_root:
+            bkp_drive = os.path.splitdrive(bkp_root)[0]
+            if bkp_drive and not os.path.exists(bkp_drive + '\\'):
+                QMessageBox.critical(self, "Backup-Laufwerk nicht erreichbar!",
+                    f"Das Backup-Laufwerk {bkp_drive} ist nicht erreichbar!\n\n"
+                    f"Bitte Laufwerk anschliessen und erneut versuchen.\n"
+                    f"Ohne funktionierendes Backup wird NICHT geloescht.")
+                return
+
+            # Speicherplatz-Check
             needed = self.compare_data['total_matched'] if mode == 'duplicates' else (
                 self.compare_data['total_matched'] + (self.compare_data['total_only1'] if w == 1 else self.compare_data['total_only2']))
             ok, free, msg = check_disk_space(bkp_root, needed)

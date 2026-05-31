@@ -31,7 +31,11 @@ try:
     # Entferne Debug-Kommentare
     from models import get_db_instance
     # Entferne Debug-Kommentare
-    from utils import logger, CONFIG, get_available_drives
+    from utils import CONFIG, get_available_drives, setup_logging
+    # Eigene Log-Datei für den Service — verhindert Rotation-Konflikt mit scanner.log
+    logger = setup_logging(log_filename="watchdog_service.log",
+                           level_str=CONFIG.get('log_level', 'INFO'),
+                           logger_name="WatchdogService")
     # Entferne Debug-Kommentare
 except ImportError as import_err:
     # Entferne Debug-Kommentare
@@ -80,14 +84,20 @@ def start_monitoring():
     except Exception as e:
         logger.error(f"Fehler beim Ermitteln der Laufwerke: {e}")
 
-    # ALT: Pfade aus der Konfiguration (könnte man zusätzlich machen, aber erstmal nur Laufwerke)
-    # config_paths = CONFIG.get("watchdog_auto_paths", [])
-    # if isinstance(config_paths, list) and config_paths:
-    #     logger.info(f"Pfade aus Konfiguration (watchdog_auto_paths): {', '.join(config_paths)}")
-    #     paths_to_watch.extend(config_paths) # Fügt sie hinzu
-    # else:
-    #     if not available_drives: # Nur warnen, wenn weder Laufwerke noch Config-Pfade da sind
-    #          logger.warning("Keine Pfade in 'watchdog_auto_paths' in config.json gefunden.")
+    # Extra-Pfade für Watchdog aus config.json (z.B. U:\ für WSL)
+    # T:\ wird hier NICHT hinzugefügt – C:\ deckt T:\ real-time ab (SUBST-Alias)
+    try:
+        from utils import load_config
+        extra_watch = load_config().get('watchdog_extra_paths', [])
+        for ep in extra_watch:
+            ep_norm = os.path.normpath(ep)
+            if os.path.isdir(ep_norm) and ep_norm not in paths_to_watch:
+                paths_to_watch.append(ep_norm)
+                logger.info(f"Extra-Watchdog-Pfad aus Config: {ep_norm}")
+            elif not os.path.isdir(ep_norm):
+                logger.warning(f"Extra-Watchdog-Pfad nicht verfügbar: {ep_norm}")
+    except Exception as e:
+        logger.warning(f"Fehler beim Laden der watchdog_extra_paths: {e}")
 
     if not paths_to_watch:
         logger.error("Keine Pfade zum Überwachen gefunden (weder automatisch noch in config). Der Dienst startet, aber überwacht nichts.")
@@ -95,6 +105,9 @@ def start_monitoring():
         # return False # Signalisiert, dass nichts gestartet wurde
 
     scheduled_count = 0
+    scheduled_paths = []
+    failed_paths = []
+    skipped_paths = []
     for path in set(paths_to_watch): # set() um Duplikate zu vermeiden
         path = os.path.normpath(path)
         if os.path.isdir(path):
@@ -102,11 +115,40 @@ def start_monitoring():
                 event_handler = FSHandler(path) # Handler für jeden Pfad separat
                 observer.schedule(event_handler, path, recursive=True)
                 logger.info(f"Überwachung für '{path}' gestartet.")
+                logger.warning(f"[Watchdog Startup] OK: '{path}' wird überwacht.")  # WARNING damit es sicher geloggt wird
                 scheduled_count += 1
+                scheduled_paths.append(path)
             except Exception as e:
                 logger.error(f"Fehler beim Starten der Überwachung für '{path}': {e}")
+                failed_paths.append(f"{path}: {e}")
         else:
             logger.warning(f"Pfad '{path}' ist kein gültiges Verzeichnis und wird ignoriert.")
+            skipped_paths.append(path)
+
+    # Startup-Report in eigene Datei schreiben (garantiert lesbar)
+    try:
+        startup_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog_startup_report.txt")
+        with open(startup_log, "w", encoding="utf-8") as f:
+            f.write(f"=== Watchdog Startup Report ===\n")
+            f.write(f"Zeitpunkt: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"PID: {os.getpid()}\n")
+            f.write(f"User: {os.environ.get('USERNAME', 'UNKNOWN')}\n\n")
+            f.write(f"Geplante Pfade: {paths_to_watch}\n\n")
+            f.write(f"Erfolgreich geschedult ({scheduled_count}):\n")
+            for p in scheduled_paths:
+                f.write(f"  OK: {p}\n")
+            if failed_paths:
+                f.write(f"\nFehlgeschlagen ({len(failed_paths)}):\n")
+                for p in failed_paths:
+                    f.write(f"  FAIL: {p}\n")
+            if skipped_paths:
+                f.write(f"\nÜbersprungen ({len(skipped_paths)}):\n")
+                for p in skipped_paths:
+                    f.write(f"  SKIP: {p}\n")
+            f.write(f"\n=== Ende Report ===\n")
+        logger.warning(f"[Watchdog Startup] Report geschrieben: {startup_log}")
+    except Exception as e:
+        logger.error(f"[Watchdog Startup] Konnte Report nicht schreiben: {e}")
 
     if scheduled_count == 0:
          logger.warning("Keine gültigen Überwachungen konnten gestartet werden.")
@@ -115,10 +157,41 @@ def start_monitoring():
     try:
         logger.info("Versuche Observer zu starten...")
         observer.start()
-        # Kurze Pause, um sicherzustellen, dass der Thread läuft
-        time.sleep(1)
+        # Längere Pause nach Start — Windows braucht Zeit für ReadDirectoryChangesW Handles
+        time.sleep(3)
         if observer.is_alive():
             logger.info("Observer erfolgreich gestartet und aktiv.")
+            logger.warning(f"[Watchdog Startup] Observer läuft. {scheduled_count} Laufwerke überwacht.")
+            
+            # Health-Check: Teste ob Events wirklich ankommen
+            def _health_check():
+                time.sleep(5)  # Warte bis Observer stabil
+                test_results = {}
+                for path in scheduled_paths:
+                    test_file = os.path.join(path, ".watchdog_health_check.tmp")
+                    try:
+                        with open(test_file, "w") as f:
+                            f.write("health_check")
+                        time.sleep(0.5)
+                        os.remove(test_file)
+                        test_results[path] = "OK"
+                    except Exception as e:
+                        test_results[path] = f"FEHLER: {e}"
+                        logger.warning(f"[Watchdog Health] Kann auf {path} nicht schreiben: {e}")
+                
+                # Report aktualisieren
+                try:
+                    startup_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog_startup_report.txt")
+                    with open(startup_log, "a", encoding="utf-8") as f:
+                        f.write(f"\n=== Health Check ({time.strftime('%H:%M:%S')}) ===\n")
+                        for path, result in test_results.items():
+                            f.write(f"  {path} -> {result}\n")
+                except:
+                    pass
+            
+            health_thread = threading.Thread(target=_health_check, daemon=True)
+            health_thread.start()
+            
             return True
         else:
             logger.error("Observer-Thread konnte nicht gestartet werden oder ist sofort wieder beendet.")

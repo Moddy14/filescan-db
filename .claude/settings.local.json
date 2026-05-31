@@ -36,7 +36,12 @@
       "Bash(git fsck:*)",
       "Bash(./comprehensive_system_test.bat)",
       "Bash(cmd.exe /c \"sc qc DateiScannerWatchdog\")",
-      "Bash(cmd.exe /c \"reg query \"\"HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\DateiScannerWatchdog\\\\Parameters\"\"\")"
+      "Bash(cmd.exe /c \"reg query \"\"HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\DateiScannerWatchdog\\\\Parameters\"\"\")",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git status:*)",
+      "Bash(pip install:*)"
     ],
     "deny": []
   }

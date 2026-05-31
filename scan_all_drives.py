@@ -6,7 +6,7 @@ import logging
 
 # Importiere zentrale Funktionen und Konstanten
 try:
-    from utils import logger, setup_logging, PROJECT_DIR, get_available_drives
+    from utils import logger, setup_logging, PROJECT_DIR, get_available_drives, load_config
     from models import get_db_instance
 except ImportError:
     print("FEHLER: utils.py oder models.py nicht gefunden. Stelle sicher, dass das Skript im Hauptverzeichnis des Projekts liegt.")
@@ -27,8 +27,34 @@ except TypeError:
     logger = logging.getLogger("ScanAllDrives_Fallback")
 
 
+def classify_scan_exit_code(returncode):
+    """Bildet den Exit-Code von scanner_core.py auf einen Status ab.
+
+    scanner_core.py-Konvention:
+        0 = Scan erfolgreich
+        3 = Scan-Lock konnte nicht erworben werden (ein ANDERER Scan läuft) -> skipped
+        sonst (insb. 1 = run_scan() lieferte False) = FATALER Fehler -> failed
+
+    Frueher wurde Exit 1 faelschlich als "skipped" und Exit 3 als "failed"
+    interpretiert (vertauscht), wodurch echte Hard-Fails als harmlose Skips
+    gemeldet wurden.
+
+    Returns:
+        str: "success" | "skipped" | "failed"
+    """
+    if returncode == 0:
+        return "success"
+    if returncode == 3:
+        return "skipped"
+    return "failed"
+
+
 def run_scan_for_drive(drive_path):
-    """Führt scanner_core.py für ein bestimmtes Laufwerk mit --restart aus."""
+    """Führt scanner_core.py für ein bestimmtes Laufwerk mit --restart aus.
+
+    Returns:
+        str: "success" | "skipped" | "failed"
+    """
     logger.info(f"Starte Scan für Laufwerk: {drive_path} (mit --restart)")
     
     # Pfad zum Python-Interpreter dieses Skripts
@@ -38,7 +64,7 @@ def run_scan_for_drive(drive_path):
     
     if not os.path.exists(scanner_script):
         logger.error(f"scanner_core.py nicht gefunden unter: {scanner_script}")
-        return False
+        return "failed"
         
     command = [python_exe, scanner_script, drive_path, "--restart"]
     
@@ -57,34 +83,56 @@ def run_scan_for_drive(drive_path):
              logger.debug(f"Scan-Ausgabe für {drive_path}:\n{result.stdout}")
         if result.stderr:
              logger.warning(f"Scan-Fehlerausgabe für {drive_path}:\n{result.stderr}")
-        return True
+        return "success"
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"Scan für {drive_path} fehlgeschlagen (Exit Code: {e.returncode}).")
+        status = classify_scan_exit_code(e.returncode)
+        if status == "skipped":
+            # Exit 3: scanner_core konnte den Scan-Lock nicht erwerben -> anderer Scan lief
+            logger.warning(f"Laufwerk {drive_path} übersprungen (ein anderer Scan läuft bereits, Exit Code {e.returncode}).")
+            return "skipped"
+        # Exit 1 (oder sonstiger Code): echter, fataler Scan-Fehler
+        logger.error(f"Scan für {drive_path} FEHLGESCHLAGEN (Exit Code: {e.returncode}).")
         if e.stderr:
             logger.error(f"Stderr:\n{e.stderr}")
         if e.stdout:
             logger.error(f"Stdout:\n{e.stdout}")
-        # Bei Exit Code 1: Warnung statt Fehler (könnte Zugriffsrechte sein)
-        if e.returncode == 1:
-            logger.warning(f"Laufwerk {drive_path} übersprungen (möglicherweise Zugriffsrechte oder leer)")
-            return True  # Als Erfolg werten, um weitere Scans fortzusetzen
-        return False
+        return "failed"
     except Exception as e:
         logger.error(f"Unerwarteter Fehler beim Ausführen des Scans für {drive_path}: {e}")
-        return False
+        return "failed"
 
 def main():
     logger.info("===== Starte Skript zum Scannen aller Laufwerke ====")
-    
+
+    # Lockdatei schreiben → Watchdog-FSHandler pausieren (auch wenn von Systray gestartet)
+    try:
+        from scan_lock import write_scan_lockfile, remove_scan_lockfile
+        write_scan_lockfile("scan_all_drives")
+        _scan_lock_imported = True
+    except Exception as e:
+        logger.warning(f"scan_lock nicht verfügbar (Watchdog läuft evtl. weiter): {e}")
+        _scan_lock_imported = False
+
     # Datenbankinstanz holen (wird für Lock-Prüfung benötigt)
     try:
         db = get_db_instance()
     except Exception as e:
         logger.critical(f"Konnte keine Datenbankverbindung herstellen: {e}")
         logger.critical("Skript wird beendet.")
+        if _scan_lock_imported:
+            remove_scan_lockfile()
         sys.exit(1)
-        
+
+    # Verwaiste Scan-Locks abgestürzter/gekillter Scans heilen, sonst würde
+    # is_scan_running() dauerhaft True liefern und ALLE Laufwerke übersprungen.
+    try:
+        healed = db.heal_stale_scan_locks()
+        if healed:
+            logger.warning(f"{healed} verwaisten Scan-Lock(s) freigegeben (toter Prozess).")
+    except Exception as e:
+        logger.warning(f"Konnte verwaiste Scan-Locks nicht prüfen: {e}")
+
     # Verfügbare Laufwerke holen (nur kanonische, ohne Aliases)
     try:
         from drive_alias_detector import get_canonical_drive_list
@@ -101,6 +149,21 @@ def main():
         if not drives:
             return
 
+    # Extra-Laufwerke aus config.json anhängen (z.B. T:\, U:\)
+    # Diese werden trotz Alias/Netzwerk-Status explizit gescannt
+    try:
+        extra_drives = load_config().get('extra_scan_drives', [])
+        for extra in extra_drives:
+            extra_norm = os.path.normpath(extra) + os.sep
+            # Nur hinzufügen wenn verfügbar und noch nicht in der Liste
+            if os.path.exists(extra_norm) and extra_norm not in drives:
+                drives.append(extra_norm)
+                logger.info(f"Extra-Laufwerk aus Config hinzugefügt: {extra_norm}")
+            elif not os.path.exists(extra_norm):
+                logger.warning(f"Extra-Laufwerk nicht verfügbar (übersprungen): {extra_norm}")
+    except Exception as e:
+        logger.warning(f"Fehler beim Laden der extra_scan_drives: {e}")
+
     # Alle Laufwerke nacheinander scannen (robuste Version)
     failed_drives = []
     successful_drives = []
@@ -116,10 +179,13 @@ def main():
             continue # Zum nächsten Laufwerk
             
         # Scan für das aktuelle Laufwerk ausführen
-        success = run_scan_for_drive(drive)
-        if success:
+        status = run_scan_for_drive(drive)
+        if status == "success":
             successful_drives.append(drive)
             logger.info(f"Scan für {drive} erfolgreich abgeschlossen.")
+        elif status == "skipped":
+            skipped_drives.append(drive)
+            logger.warning(f"Laufwerk {drive} übersprungen.")
         else:
             failed_drives.append(drive)
             logger.warning(f"Laufwerk {drive} fehlgeschlagen. Setze mit nächstem fort.")
@@ -144,5 +210,15 @@ def main():
     else:
         logger.info("===== Alle verfügbaren Laufwerke erfolgreich gescannt ====")
 
+    # Lockdatei am Ende immer entfernen (auch bei Teilfehlern)
+    if _scan_lock_imported:
+        remove_scan_lockfile()
+
+    # Exit-Code spiegelt FATALE Laufwerks-Fehler wider, damit Aufrufer
+    # (scheduled_scanner-Log etc.) einen echten Fehlschlag erkennen koennen.
+    # 'skipped' (anderer Scan lief) ist KEIN Fehler und beeinflusst den Code nicht.
+    if failed_drives:
+        sys.exit(1)
+
 if __name__ == "__main__":
-    main() 
+    main()

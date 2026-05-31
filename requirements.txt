@@ -1,6 +1,12 @@
-watchdog
-PyQt5
-pystray
-Pillow
-psutil # Wird von auto_update_all.py benötigt
-pyinstaller # Wird von build_portable.py benötigt 
+# Laufzeit-Abhaengigkeiten – gepinnt auf die getesteten Versionen (Python 3.10+).
+# Stand: 2026-05-29, verifiziert gegen die aktive Umgebung (D:\Python313).
+watchdog==6.0.0        # Echtzeit-Dateisystem-Events (watchdog_monitor.py / watchdog_service.py)
+PyQt5==5.15.11         # GUI-Framework: gui_launcher.py, systray_launcher_full.py, die meisten Tools
+PyQt6==6.10.0          # nur Dateien_Skripte/Space_Recovery_Advisor.py (siehe Roadmap: auf PyQt5 vereinheitlichen)
+pystray==0.19.5        # Systray-Integration (systray_launcher_full.py)
+Pillow==10.4.0         # Icon-/Bildverarbeitung fuer den Systray
+psutil==5.9.6          # Prozess-/PID-Validierung (Scan-Lock, auto_update_all.py)
+pyinstaller==6.12.0    # Erstellen portabler Executables (build_portable.py)
+
+# Entwicklung / Tests
+pytest==8.3.5          # Test-Suite unter tests/

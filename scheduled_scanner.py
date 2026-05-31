@@ -11,6 +11,7 @@ import json
 # Importiere zentrale Funktionen und Konstanten
 from utils import logger, CONFIG, PROJECT_DIR, load_config, save_config
 from models import get_db_instance
+from scan_lock import pause_fs_writes, resume_fs_writes
 
 # Datei zum Tracking der letzten Ausfuehrungen
 _LAST_RUN_FILE = os.path.join(PROJECT_DIR, '.scheduled_last_runs.json')
@@ -49,12 +50,20 @@ def _scan_key(scan_config):
 
 
 def _parse_time(time_str):
-    """Parst einen HH:MM-String in (hour, minute). Gibt None bei Fehler zurueck."""
+    """Parst einen HH:MM-String in (hour, minute).
+
+    Gibt None bei Fehler ODER ausserhalb gueltiger Bereiche (0-23 / 0-59) zurueck.
+    Letzteres ist wichtig, weil should_scan_run_now sonst via
+    datetime.replace(hour=24) mit ValueError abstuerzen wuerde.
+    """
     try:
         parts = time_str.split(":")
-        return int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
+        hour, minute = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError, AttributeError, TypeError):
         return None
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour, minute
+    return None
 
 
 def get_scheduled_scans():
@@ -226,8 +235,44 @@ def execute_scan(scan_config):
         stdout_log = os.path.join(PROJECT_DIR, f"scheduled_stdout_{log_name_part}.log")
         stderr_log = os.path.join(PROJECT_DIR, f"scheduled_stderr_{log_name_part}.log")
 
-        with open(stdout_log, 'ab') as f_out, open(stderr_log, 'ab') as f_err:
-            subprocess.Popen(command, stdout=f_out, stderr=f_err)
+        # FSHandler-Writes pausieren damit Watchdog-Threads nicht in die DB schreiben
+        # während der Scan eine lange exklusive Transaktion hält → kein "database locked"
+        pause_fs_writes(scan_name=f"{scan_type} ({log_info_path})")
+        try:
+            with open(stdout_log, 'ab') as f_out, open(stderr_log, 'ab') as f_err:
+                # subprocess.run (blockend) statt Popen – wir warten auf Abschluss
+                # damit resume_fs_writes() erst nach echtem Scan-Ende aufgerufen wird
+                result = subprocess.run(command, stdout=f_out, stderr=f_err)
+                if result.returncode != 0:
+                    logger.warning(f"[Scheduled Scan] Scan beendet mit Exit-Code {result.returncode}: {log_info_path}")
+                else:
+                    logger.info(f"[Scheduled Scan] Scan erfolgreich abgeschlossen: {log_info_path}")
+
+                # Windows-seitiger, read-only Health-Probe direkt nach dem Full-Rebuild,
+                # BEVOR Watchdog-FSHandler wieder schreiben duerfen. Dadurch sehen wir
+                # morgen eindeutig, ob die frisch gebaute WAL-DB schon defekt ist oder
+                # erst nach Watchdog/GUI/Search-Zugriffen kippt.
+                if scan_type == 'full':
+                    probe_script = os.path.join(PROJECT_DIR, 'db_health_probe.py')
+                    if os.path.exists(probe_script):
+                        probe_cmd = [
+                            python_exe,
+                            probe_script,
+                            '--quick-check',
+                            '--limit', '20',
+                            '--max-sql-seconds', '180',
+                        ]
+                        logger.info('[Scheduled Scan] Starte post-rebuild DB-Health-Probe (read-only, Watchdog noch pausiert).')
+                        probe_result = subprocess.run(probe_cmd, stdout=f_out, stderr=f_err)
+                        if probe_result.returncode == 0:
+                            logger.info('[Scheduled Scan] Post-rebuild DB-Health-Probe erfolgreich.')
+                        else:
+                            logger.warning(f"[Scheduled Scan] Post-rebuild DB-Health-Probe beendet mit Exit-Code {probe_result.returncode}.")
+                    else:
+                        logger.warning(f"[Scheduled Scan] DB-Health-Probe nicht gefunden: {probe_script}")
+        finally:
+            # Immer wieder freigeben, auch bei Fehler oder Ausnahme
+            resume_fs_writes()
 
         _mark_scan_executed(scan_config)
         return True
@@ -252,7 +297,21 @@ def check_and_run_scheduled_scans():
     # --- Nachhol-Queue zuerst pruefen ---
     if _catchup_queue:
         now = datetime.datetime.now()
-        target_time, scan_config = _catchup_queue[0]
+        entry = _catchup_queue[0]
+
+        # Defensiv: Eintrag validieren (Tupel mit datetime + dict erwartet)
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            logger.error(f"[Scheduled Scan] Ungültiger Catchup-Queue-Eintrag, wird verworfen: {entry!r}")
+            _catchup_queue.pop(0)
+            return
+
+        target_time, scan_config = entry
+
+        # Defensiv: target_time muss datetime sein
+        if not isinstance(target_time, datetime.datetime):
+            logger.error(f"[Scheduled Scan] target_time ist kein datetime ({type(target_time).__name__}), wird verworfen.")
+            _catchup_queue.pop(0)
+            return
 
         # Ist die Zielzeit erreicht?
         if now >= target_time:
@@ -310,19 +369,32 @@ def run_scheduler_loop(interval=30, stop_event=None):
         stop_event: Optional threading.Event zum sauberen Beenden
     """
     logger.info(f"[Scheduled Scanner] Scheduler gestartet (Intervall: {interval}s)")
-    try:
-        while True:
-            if stop_event and stop_event.is_set():
-                logger.info("[Scheduled Scanner] Stop-Signal empfangen, beende Scheduler.")
-                break
+
+    # Startup-Verzögerung: Boot-Phase abwarten, damit DB und FSHandler
+    # sich stabilisieren bevor der erste Check läuft (verhindert Startup-Lockburst)
+    startup_delay = 60  # Sekunden
+    logger.info(f"[Scheduled Scanner] Warte {startup_delay}s auf System-Stabilisierung...")
+    for _ in range(startup_delay):
+        if stop_event and stop_event.is_set():
+            return
+        time.sleep(1)
+    logger.info("[Scheduled Scanner] Startup-Delay abgelaufen, beginne Scheduling.")
+
+    while True:
+        if stop_event and stop_event.is_set():
+            logger.info("[Scheduled Scanner] Stop-Signal empfangen, beende Scheduler.")
+            break
+        try:
             check_and_run_scheduled_scans()
-            # Warte in kleinen Schritten, um Stop-Signal schneller zu erkennen
-            for _ in range(interval):
-                if stop_event and stop_event.is_set():
-                    break
-                time.sleep(1)
-    except Exception as e:
-        logger.error(f"[Scheduled Scanner] Fehler in Scheduler-Schleife: {e}")
+        except Exception as e:
+            logger.error(f"[Scheduled Scanner] Fehler in Scheduler-Schleife: {e}", exc_info=True)
+            # Kurze Pause nach Fehler, dann weitermachen (Thread stirbt NICHT)
+            time.sleep(5)
+        # Warte in kleinen Schritten, um Stop-Signal schneller zu erkennen
+        for _ in range(interval):
+            if stop_event and stop_event.is_set():
+                break
+            time.sleep(1)
 
 
 def main():
